@@ -1,0 +1,80 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+A Rust library crate (`actix-web-oidc-bff`): a Backend-for-Frontend OIDC relying party for actix-web. The authorization-code + PKCE flow happens server-side; tokens never reach the browser — the cookie carries only a session reference. There is no binary; consumers mount the routes into their own actix-web app.
+
+## Commands
+
+```sh
+cargo build
+cargo test                      # all tests (unit tests live in #[cfg(test)] modules per file)
+cargo test scopes_parsed        # run a single test by name substring
+cargo test config::             # run all tests in one module
+cargo clippy --all-targets
+cargo fmt
+```
+
+Note: tests in `config.rs` mutate process env vars and are serialized via a `static ENV_LOCK: Mutex`. Any new test touching `OIDC_*` env vars must use the `with_required_env` helper (or take that lock) to avoid flaky parallel runs.
+
+## Architecture
+
+The crate wires together seven concerns; the flow spans multiple files:
+
+1. **`session_state.rs` — constants + pre-auth machinery**: defines all session key constants (`SUB`, `ISS`, `EMAIL`, `NAME`, `ACCESS_TOKEN`, `REFRESH_TOKEN`, `ID_TOKEN`, `CLAIM_KEYS`, `PRE_AUTH`) and the hand-maintained `RESERVED_SESSION_KEYS` array. **`RESERVED_SESSION_KEYS` is NOT derived mechanically** — when adding a new session key constant you must also add it to `RESERVED_SESSION_KEYS`; the `reserved_keys_cover_every_constant` test enforces membership. Also exports `POST_AUTH_SCRUB_KEYS` (all token/identity keys minus always-overwritten `SUB`/`ISS`), `PRE_AUTH_MAX_SLOTS = 5`, `PreAuthEntry`, and the pre-auth slot helpers (`push_pre_auth`, `take_matching`, `prune_expired`) plus `insert_or_internal` (logs the real error, maps to `BffError::Internal`). `take_matching` calls `constant_time_eq` unconditionally for every slot — no cross-slot early exit — so timing does not reveal which slot matched.
+
+2. **`config.rs` — `OidcBffConfig`**: built from `OIDC_*` env vars (`from_env()`) and returns `ConfigError` on failure. Holds issuer/client credentials, cookie settings (`__Host-` prefixed cookie when the redirect URL is https), scopes, TTLs, `return_to_prefix`, `persist_claims`, and `post_logout_redirect_url`. Also precomputes `pub(crate) allowed_origin: String` — the ASCII origin of `redirect_url` (scheme+host+port, default ports omitted) — for CSRF checks. `from_env()` rejects: `persist_claims` entries that collide with `RESERVED_SESSION_KEYS` (imported from `session_state.rs`); OIDC validation-artifact claim names (`aud`, `exp`, `iat`, `nbf`, `nonce`, `at_hash`, `c_hash`) — these have no persistence use and invite confusion; a `return_to_prefix` that fails `validate_return_to`; and `OIDC_POST_LOGOUT_REDIRECT_URL` values that are not valid http/https URLs, have an opaque/hostless origin, or are plain http when the redirect URL is https.
+
+   `ConfigError` typed variants: `MissingEnv`, `InvalidSessionKey`, `InvalidRedirectUrl`, `InvalidPostLogoutRedirectUrl`, `InvalidReturnToPrefix`, `ReservedClaimName`.
+
+3. **`oidc.rs` — `OidcRp`**: OIDC discovery + cached client. Key design points:
+   - `BffExtraProviderMetadata` (not `EndSessionMetadata`) captures `end_session_endpoint` and `revocation_endpoint` from the discovery document.
+   - `struct RpInner { metadata: BffProviderMetadata, client: Arc<BffClient> }` is held behind `Arc<RwLock<RpInner>>`. The client is rebuilt once per (re)discovery — `client()` returns `Arc<BffClient>` (a clone of the cached Arc, not a deep clone of the client).
+   - **Hard constraint**: the network fetch in `refresh_metadata()` is performed before taking the write lock on `RpInner` — the write lock is never held across an `await`. Violating this deadlocks.
+   - HTTP timeouts: `HTTP_TIMEOUT = 10s`, `HTTP_CONNECT_TIMEOUT = 5s` on the shared client. These are compile-time constants (deliberate — an env knob is an easy follow-up if needed). The client has redirect `Policy::none()` to prevent SSRF via malicious provider responses.
+   - `allowed_algs() -> &'static [CoreJwsSigningAlgorithm]` is backed by a 9-element static array of RS\*/PS\*/ES\* algorithms. `HS*` and `none` are excluded at compile time.
+   - `force_refresh_for_retry() -> bool`: called by the callback after an ID-token validation failure. Stampede-guarded via `try_write` on `last_forced_refresh: RwLock<Option<Instant>>`, rate-limited to one attempt per `FORCED_REFRESH_MIN_INTERVAL = 60s`. Returns `true` only on a successful refresh. Worst-case callback retry latency with three sequential 10s HTTP timeouts is ~30 s — operators should set upstream timeouts (e.g. load-balancer request timeout) accordingly.
+   - `end_session_endpoint()` / `revocation_endpoint()` read from `inner.metadata.additional_metadata()`.
+   - `#[cfg(test)]` helpers: `test_metadata(extra: BffExtraProviderMetadata) -> BffProviderMetadata` (builds a minimal discovery doc via `serde_json::from_value`); `for_tests(metadata) -> OidcRp` (client_id "test-client", secret "test-secret", redirect "https://app.example.com/auth/callback", jwks_ttl 1h, `last_refresh = now`).
+
+4. **`handlers/` + `routes.rs`**: four routes registered by `configure()`:
+   - `GET /auth/login` — validates `return_to` (open-redirect defense) and applies a **boundary-aware prefix check**: `return_to` must equal `cfg.return_to_prefix` or start with it and be followed by `/`; prefix `/app` accepts `/app` and `/app/sub` but rejects `/appointments` and `/app-evil`. An empty `return_to` query parameter is treated as absent and defaults to `cfg.return_to_prefix`. Generates state/nonce/PKCE, loads the `PRE_AUTH` vec from the session, prunes expired entries, pushes the new `PreAuthEntry` (FIFO-evicts at `PRE_AUTH_MAX_SLOTS = 5`), and writes the vec back in a single `insert_or_internal` call. The vec is keyed `oidc_pre_auth` and supports up to 5 concurrent login attempts (e.g. multiple tabs). `openid` is filtered from `cfg.scopes` before `authorize_url` to avoid duplicating it (the library adds it automatically). PKCE S256 is unconditional.
+   - `GET /auth/callback` — (1) removes the `PRE_AUTH` vec from the session; (2) handles IdP `error` params: if `state` is present, consumes only the matching slot and writes the remainder back; if `state` is absent, writes the full (pruned) vec back untouched — a stateless error redirect must not nuke concurrent tabs' slots; (3) requires code+state; (4) `take_matching` with constant-time comparison across all slots; writes `rest` back before any later failure path; (5) exchanges code; (6) validates ID token against static allowed algs; on failure: `force_refresh_for_retry()`, retry once, else 400; (7) `session.renew()` against session fixation; (8) scrubs `POST_AUTH_SCRUB_KEYS` plus old `CLAIM_KEYS` list; (9) inserts standard claims; (10) `serde_json::to_value(claims)` on the full `IdTokenClaims` struct and uses `select_claims` to pick `persist_claims` entries uniformly — no amr/acr special-case, the serialization flatten handles them; stores each value as `serde_json::Value` directly; (11) writes `CLAIM_KEYS` list; (12) inserts tokens via `insert_or_internal`.
+   - `POST /auth/logout` — (1) `ensure_same_origin_against(&req, &cfg.allowed_origin)` (fast path using precomputed origin); (2) reads `ID_TOKEN`, `REFRESH_TOKEN`, `ACCESS_TOKEN` **before** `session.purge()`; (3) resolves `end_session_endpoint` URL **before** purge — malformed URL: `log::warn!` including the endpoint value, degrade to 204 (revocation still runs); (4) `revoke_best_effort`: refresh preferred over access, uses a **parsed-scheme https guard** (`Url::parse(endpoint).map(|u| u.scheme() == "https")`) to reject non-https revocation endpoints when `cfg.cookie_secure` — the `url` crate lowercases schemes on parse so `HTTPS://...` is also accepted; this guard is inactive when `cookie_secure == false` (http dev deployments); malformed endpoint → not-https → skip + warn (fail-closed on transmission, fail-open on revocation); clones the cached `Arc<BffClient>` via `(*client).clone().set_revocation_url(url)`, calls `revoke_token(..).request_async(oidc.http_client())` using the **shared redirect-disabled, timeout-configured client** (never a freshly built client — that could follow redirects or lack timeouts), warn-and-continue on every failure, **never logs token values** (endpoint + error kind only); (5) `session.purge()`; (6) 200 + `{"idp_logout_url"}` or 204.
+   - `GET /auth/me` — takes `Auth` extractor (401 produced by extractor when no `sub`); returns exactly `{"sub", "iss", "email", "name"}` — no tokens, no extra claims.
+   Shared state (`OidcRp`, `OidcBffConfig`) is registered separately via `configure_app_data()`.
+
+5. **`extractor.rs` — `Auth`**: `FromRequest` extractor for downstream handlers. Sync extraction via `future::ready(Auth::extract(req))`. Reads `sub` (401 if absent) plus standard fields from session-key constants. Rehydrates extra claims: reads the `CLAIM_KEYS` vec, then reads each claim as `serde_json::Value` directly (no double-decoding — callback now stores values as `Value`, not JSON-encoded strings).
+
+6. **`store.rs` — `SessionRepository` / `DbSessionStore`**: bring-your-own persistent session storage (the crate has no DB dependency). `DbSessionStore` adapts a consumer-supplied `SessionRepository` to `actix_session::storage::SessionStore`, making sessions revocable server-side. The `load()` path enforces expiry regardless of whether the repository filtered the row (`s.expires_at <= Utc::now()` → best-effort `repo.delete()` + `Ok(None)`). This is defense-in-depth: compliant repos should filter on the DB side, but this catches stale rows from non-compliant ones or race conditions.
+
+   **Pre-auth TTL cap**: `DbSessionStore` holds a `pre_auth_ttl_secs` field (default 600 s, matches `OidcBffConfig::pre_auth_ttl_secs`) and applies `ttl_secs.min(pre_auth_ttl_secs)` in `save()` and `update()` for rows that do not contain the `SUB` session key (i.e., anonymous/pre-auth state). Authenticated rows use the full TTL. Override via `DbSessionStore::with_pre_auth_ttl_secs(secs)`, typically set to `cfg.pre_auth_ttl_secs`. This caps the session-store DoS window for an unauthenticated flood of `/auth/login` requests; rate-limiting at the deployment level is still recommended.
+
+   **`SessionRepository::update` contract**: `update` returns `Ok(true)` when the row was updated, `Ok(false)` when no such key exists (do not error for a missing key). The adapter interprets `false` (row vanished — purged or expired between load and write) with a **do-not-resurrect guard**: if the state contains any token key (`ACCESS_TOKEN`, `REFRESH_TOKEN`, `ID_TOKEN`), the write is dropped and the stale key is returned — purge is authoritative, a request racing logout cannot recreate a token-bearing row. For token-free state (pre-auth/anonymous) the adapter mirrors actix-session's Redis semantics: generates a new session key, inserts with the pre-auth-capped TTL (reusing the A-1 helper), and returns the new key to preserve multi-tab login ergonomics.
+
+   **This is the only module allowed to use `anyhow`** — the `SessionStore` trait forces `anyhow::Error` into its signatures; everything else uses `BffError`/`ConfigError`/`DiscoveryError`/`RepoError`.
+
+7. **`middleware.rs` — `session_middleware()`**: builds the hardened `SessionMiddleware` from the config (cookie name/Secure from config, HttpOnly, SameSite=Lax, Path=/, persistent TTL from `post_auth_ttl_secs`). This is what makes the config's cookie/TTL fields actually take effect — consumers should wrap their `App` with it. Note: the middleware TTL applies to authenticated sessions; `DbSessionStore` independently caps the TTL for anonymous/pre-auth rows — these are two orthogonal settings.
+
+### Error conventions
+
+| Type | Where | Used for |
+|---|---|---|
+| `BffError` | handlers, extractor | Per-request errors; `ResponseError` impl maps to RFC 9457 problem+json (400/401/500). |
+| `ConfigError` | `config.rs` | `from_env()` failures; typed variants (`MissingEnv`, `InvalidSessionKey`, `InvalidRedirectUrl`, `InvalidReturnToPrefix`, `ReservedClaimName`). |
+| `DiscoveryError` | `oidc.rs` | `discover()` / `refresh_metadata()` failures; typed variants (`InvalidIssuerUrl`, `InvalidRedirectUrl`, `HttpClient`, `Discovery`, `NoAsymmetricAlg`). Both are re-exported from `lib.rs`. |
+| `RepoError` + `anyhow` | `store.rs` only | `SessionStore` trait boundary; `anyhow` is confined here. |
+
+### Security invariants to preserve
+
+- Tokens (`access_token`, `refresh_token`, `id_token`) live only in the server-side session and are never exposed by `/auth/me` or the `Auth` extractor. The `RESERVED_SESSION_KEYS` deny-list in `session_state.rs` (not `config.rs`) keeps `persist_claims` from shadowing these keys — **this list is hand-maintained, not auto-derived**; when adding a new session key constant, add it to the constant list AND to `RESERVED_SESSION_KEYS`. The `reserved_keys_cover_every_constant` test enforces membership.
+- `validate_return_to` (in `handlers/login.rs`, re-exported at crate root) requires a printable-ASCII absolute path (≤512 bytes) and rejects `//`, `\`, and `:/` — open-redirect protection including backslash normalization (`/\evil.com` → `//evil.com` in browsers). `return_to_prefix` is validated at startup via the same function.
+- PKCE S256 is unconditional; ID-token validation only accepts the 9 asymmetric algorithms in the static `ALLOWED_ALGS` array (RS\*/PS\*/ES\*).
+- Pre-auth slots (`oidc_pre_auth` vec, cap `PRE_AUTH_MAX_SLOTS = 5`) are scanned with constant-time comparison across **all** slots — no cross-slot early exit. FIFO eviction is an availability trade-off (not a security boundary); state is cryptographically validated. The cap of 5 slots (~1.1 KB serialized) is sized for `DbSessionStore`. **`CookieSessionStore` + 5 slots × a long `return_to` can exceed the ~4 KB cookie limit and silently break login** (the cookie is simply dropped by the browser). `DbSessionStore` is the supported configuration for applications that need concurrent logins (e.g. multiple open tabs).
+- The callback writes the `rest` vec back to the session **before** any later failure path, so a failed exchange does not nuke concurrent tabs' pre-auth slots.
+- IdP `error` callback values are logged but never reflected into responses. A stateless error redirect (no `state`) leaves the pre-auth vec intact.
+- `ensure_same_origin_against` compares the precomputed ASCII origin from `cfg.allowed_origin` — never naive string prefix matching, never re-parsing the redirect URL per request.
+- `revoke_best_effort` uses the crate's shared redirect-disabled HTTP client. Token values are never logged; only the endpoint URL and error kind appear in log output.
+- Errors map to RFC 9457 problem+json via `BffError`'s `ResponseError` impl. Internal errors never leak detail strings to the client.
