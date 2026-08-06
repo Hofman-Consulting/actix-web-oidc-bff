@@ -1,0 +1,8 @@
+[workspace]
+# CHANGELOG.md is manually maintained (Keep a Changelog); release-plz must not touch it.
+changelog_update = false
+# GitHub Releases are created by .github/workflows/github-release.yml from CHANGELOG.md,
+# because release-plz's {{ changelog }} is empty when changelog_update = false.
+git_release_enable = false
+# Defaults kept: git_tag_enable = true, git_tag_name = "v{{ version }}" (single package),
+# publish = true, semver_check = true, release_always = true.

@@ -83,3 +83,29 @@ jobs:
           tool: cargo-audit
       - name: audit
         run: cargo audit
+
+  release-gate:
+    # PR-only. release-plz tags the merge commit and a tag-triggered workflow
+    # cuts the GitHub Release from the matching CHANGELOG.md section. If that
+    # section is missing at the tagged commit the release fails irrecoverably
+    # (the tag points at an immutable commit), so block the merge here instead.
+    # Passes on normal PRs because the already-released version keeps its section.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: changelog has section for crate version
+        run: |
+          VERSION=$(grep -m1 '^version = "' Cargo.toml | cut -d'"' -f2)
+          echo "Crate version: ${VERSION}"
+          if ! grep -q "^## \[${VERSION}\] - " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${VERSION}] - ...' section."
+            echo "Release PRs must roll [Unreleased] into [${VERSION}] before merge."
+            exit 1
+          fi
+          if ! grep -q "^\[${VERSION}\]: " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing the '[${VERSION}]: ...' link reference."
+            echo "Release PRs must roll [Unreleased] into [${VERSION}] before merge."
+            exit 1
+          fi
+          echo "CHANGELOG.md has a complete section for ${VERSION}."
