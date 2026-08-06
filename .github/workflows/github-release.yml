@@ -1,0 +1,26 @@
+name: GitHub Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+# Least privilege at the top level; the job below opts into what it needs.
+permissions: {}
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
+        with:
+          # Extract the section matching the tag's version (Keep a Changelog format).
+          changelog: CHANGELOG.md
+          # Reject tags not reachable from master.
+          branch: master
+          # Default token is fine; the created Release triggers nothing downstream.
+          token: ${{ secrets.GITHUB_TOKEN }}

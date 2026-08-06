@@ -32,8 +32,8 @@ identity and tokens live in a server-managed session.
 | Route | Method | Purpose |
 |---|---|---|
 | `/auth/login` | GET | Start the flow; redirects to the IdP. Optional `?return_to=/path`. |
-| `/auth/callback` | GET | Code exchange, ID-token validation, session establishment. |
 | `/auth/logout` | POST | Same-origin check, purge session, return IdP logout URL (200) or 204. |
+| `/auth/callback` | GET | Code exchange, ID-token validation, session establishment. |
 | `/auth/me` | GET | Identity claims (`sub`, `iss`, `email`, `name`) — never tokens. |
 
 ## Quickstart
@@ -116,6 +116,29 @@ async fn protected(auth: bff::Auth) -> String {
 - **Logout CSRF** is mitigated via `Sec-Fetch-Site` (modern browsers) with
   `Origin`/`Referer` origin comparison as fallback, measured against the
   `OIDC_REDIRECT_URL` origin.
+
+## Releasing
+
+Releases are automated with [release-plz]. Every push to `master` updates a
+release PR that bumps the version — conventional commits and
+[cargo-semver-checks] decide the bump (override it by editing `Cargo.toml` on
+the release PR branch).
+
+Before merging the release PR, roll the changelog: rename `[Unreleased]` to
+`## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md` and add the `[X.Y.Z]: ...` compare
+link reference at the bottom. The `release-gate` CI job blocks the merge until
+this section exists.
+
+Merging publishes to crates.io via Trusted Publishing (OIDC, GitHub environment
+`release`) and pushes tag `vX.Y.Z`; the tag triggers a workflow that creates the
+GitHub Release from the changelog section.
+
+If the crates.io publish succeeded but the tag push failed, push the tag
+manually: `git tag vX.Y.Z && git push origin vX.Y.Z`. Re-running the release
+job is a no-op once the version is on crates.io.
+
+[release-plz]: https://release-plz.dev
+[cargo-semver-checks]: https://github.com/obi1kenobi/cargo-semver-checks
 
 ## License
 
