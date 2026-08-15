@@ -5,7 +5,23 @@ on:
     branches: [master]
 
 # Least privilege at the top level; each job opts into exactly what it needs.
+#
+# NOTE: a job's `permissions:` block scopes only the ephemeral GITHUB_TOKEN
+# that Actions injects. Both jobs below deliberately *replace* that token with
+# a GitHub App installation token (so that pushed tags and PRs trigger other
+# workflows, which the default token cannot do). The App token's scope comes
+# from the App's own permissions and its installation, not from these blocks —
+# so the least-privilege annotations here are not an assurance about the
+# credential that actually authenticates release-plz. Constrain the App itself.
 permissions: {}
+
+# Same pinned toolchain as ci.yml. release-plz builds the crate to verify and
+# publish it, so it should use the version CI validated — not whatever `stable`
+# happens to be on release day.
+#
+# Keep in sync with PINNED_TOOLCHAIN in ci.yml.
+env:
+  PINNED_TOOLCHAIN: "1.97.1"
 
 jobs:
   release-plz-release:
@@ -21,23 +37,37 @@ jobs:
       group: release-plz-release
       cancel-in-progress: false
     steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          # Client ID (Iv23li…), not the numeric App ID: the `app-id` input is
+          # deprecated in favour of `client-id`. It is an identifier rather than
+          # a credential, so it lives in Actions *variables*, not secrets; only
+          # the private key is sensitive.
+          client-id: ${{ vars.RELEASE_PLZ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # release-plz needs full history.
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2c7215f
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          shared-key: release-plz
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
+      # Deliberately NO rust-cache here. This is the only job holding
+      # `id-token: write` and a live publish credential, and a restored cache
+      # repopulates ~/.cargo and target/ with content that executes during the
+      # publish verify build (build scripts, proc macros). Cache poisoning from
+      # any other job would land inside the publishing job. The release path is
+      # infrequent; a cold build is the right trade. release-plz-pr keeps its
+      # own cache under a separate key.
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release
         env:
-          # PAT, not the default GITHUB_TOKEN, so the pushed tag triggers github-release.yml.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          # App token, not the default GITHUB_TOKEN, so the pushed tag triggers
+          # github-release.yml (GITHUB_TOKEN-authored events do not).
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   release-plz-pr:
     runs-on: ubuntu-latest
@@ -49,20 +79,30 @@ jobs:
       group: release-plz-pr
       cancel-in-progress: true
     steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          # Client ID (Iv23li…), not the numeric App ID: the `app-id` input is
+          # deprecated in favour of `client-id`. It is an identifier rather than
+          # a credential, so it lives in Actions *variables*, not secrets; only
+          # the private key is sensitive.
+          client-id: ${{ vars.RELEASE_PLZ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # release-plz needs full history.
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2c7215f
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
+      # Own cache key, not shared with release-plz-release (which has none).
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-plz
+          shared-key: release-plz-pr
       - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr
         env:
-          # PAT so ci.yml runs on the release PR.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          # App token so ci.yml runs on the release PR.
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

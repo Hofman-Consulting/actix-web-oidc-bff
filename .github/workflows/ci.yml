@@ -4,31 +4,70 @@ on:
   pull_request:
   push:
     branches: [master]
+  # Manual trigger, mainly to run the scheduled-only `advisories` job on demand
+  # (e.g. right after a security disclosure) without waiting for the cron.
+  workflow_dispatch:
   schedule:
-    # Weekly audit so new advisories surface after merge (Mondays 06:00 UTC).
-    - cron: "0 6 * * 1"
+    # Daily advisory sweep. A new RustSec advisory against an authentication
+    # dependency should surface within a day, not on the next push. The job is
+    # metadata-only (no compilation, ~20s), so daily costs ~10 minutes a month.
+    - cron: "17 4 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  # A panic that only reproduces in CI is otherwise undiagnosable from the log:
+  # the backtrace has to be captured on the run that failed, not a rerun.
+  RUST_BACKTRACE: 1
+  # The one Rust version this workflow uses, everywhere except `msrv`. Pinned
+  # rather than `stable` so a CI run is reproducible: rustc releases every ~6
+  # weeks, and a new release can add clippy lints or change rustfmt's output,
+  # which turns `-D warnings` into a build break on code nobody touched.
+  #
+  # `msrv` is deliberately NOT on this pin: it exists to prove the crate still
+  # builds on `rust-version` from Cargo.toml, so it carries its own toolchain.
+  #
+  # The trade-off: CI no longer tells you when a *new* stable breaks the crate,
+  # because it never sees one until this line moves. Bump deliberately — raise
+  # it, run `cargo fmt --all` and `cargo clippy --all-targets --all-features
+  # -- -D warnings` locally on the same version, fix the fallout in one commit.
+  # Nothing automates this: rustc is not a dependency, so Dependabot has no
+  # opinion about it.
+  #
+  # Keep in sync with the same value in release-plz.yml, and with paykit.
+  #
+  # NOTE: the name deliberately avoids the RUST*/CARGO*/CC*/CFLAGS/CXX/CMAKE
+  # prefixes that Swatinem/rust-cache hashes into its cache key — a top-level
+  # var with one of those prefixes would be folded into every job's key.
+  PINNED_TOOLCHAIN: "1.97.1"
 
 # Least privilege: no job needs write access.
 permissions:
   contents: read
 
-# Cancel superseded runs for the same ref (PR pushes); never cancels master/schedule.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # On a `schedule` trigger `github.ref` resolves to refs/heads/master, so a
+  # cron run would otherwise share a group with master pushes and get killed by
+  # the next one. Note `cancel-in-progress` is evaluated on the *incoming* run,
+  # so gating it on the event name cannot protect the cron — the push evaluates
+  # it, not the sweep. Isolating the cron in its own group is what actually
+  # works, and lets cancellation stay unconditional for everything else.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' }}
+  cancel-in-progress: true
 
 jobs:
   lint:
-    # Build jobs skip the weekly schedule; only audit runs on cron.
+    # Build jobs skip the cron; only `advisories` runs on schedule.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2c7215f
+        with:
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
@@ -39,10 +78,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2c7215f
+        with:
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: test
         run: cargo test
 
@@ -51,38 +92,109 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2c7215f
+        with:
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: doc (missing-docs gate)
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps
 
+  # Minimum supported Rust version, read from `rust-version` in Cargo.toml —
+  # the single source of truth, so bumping the MSRV is a one-line edit there
+  # and this job follows automatically. Neither the job name nor the step name
+  # carries the version: check names are what branch protection matches on, and
+  # a version in the name would silently stop reporting on the next bump.
   msrv:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: "1.88"
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-      - name: check (MSRV 1.88)
+          persist-credentials: false
+      - id: msrv
+        name: read MSRV from Cargo.toml
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^rust-version = "' Cargo.toml | cut -d'"' -f2 || true)
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Could not read 'rust-version = \"...\"' from Cargo.toml."
+            exit 1
+          fi
+          echo "MSRV is ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2c7215f
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: check (MSRV)
         run: cargo check --all-targets --locked
 
-  audit:
-    # Runs on push/PR and the weekly schedule. Uses the cargo-audit binary so
-    # .cargo/audit.toml (documented RUSTSEC-2023-0071 ignore) is honored.
+  deny:
+    # Replaces the old cargo-audit job. cargo-deny is a superset: it reads
+    # deny.toml (which carries the documented RUSTSEC-2023-0071 ignore that
+    # used to live in .cargo/audit.toml) and additionally enforces the licence
+    # allowlist, duplicate/wildcard bans and the crates.io-only source policy.
+    # Metadata-only, so it stays ungated on `needs:` and runs on every push/PR.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
         with:
-          tool: cargo-audit
-      - name: audit
-        run: cargo audit
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # Runs advisories + licenses + bans + sources in one pass.
+          command: check
+
+  advisories:
+    # Scheduled-only. The RustSec database moves independently of this repo, so
+    # a daily run against master reports a newly published advisory without
+    # waiting for someone to push. Advisories only — the licence/ban/source
+    # checks depend on our own tree and cannot change between pushes.
+    #
+    # NOTE: this job is *skipped* on push/PR, and a skipped check is not a
+    # success. Do not mark it as a required status check on branch protection.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
+  publish-dry-run:
+    # Catches packaging problems no other job sees: metadata crates.io rejects,
+    # a path/git dependency that cannot be published, or a file missing from
+    # the tarball because of the `include` allowlist in Cargo.toml.
+    #
+    # Safe on every push even though 0.1.0 is already on crates.io: a dry run
+    # of an already-published version is a *warning*, not an error.
+    #
+    # Caveat: `cargo publish`'s verify step builds the **lib only**. The
+    # `include` allowlist lists `examples/**`, and dropping that entry would
+    # package a broken tarball that the dry run alone would still pass — hence
+    # the explicit `--examples` build below, which compiles what the dry run
+    # does not.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2c7215f
+        with:
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: publish (dry run)
+        run: cargo publish --dry-run --locked
+      - name: build examples
+        run: cargo build --examples --locked
 
   release-gate:
     # PR-only. release-plz tags the merge commit and a tag-triggered workflow
@@ -94,16 +206,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: changelog has section for crate version
         run: |
-          VERSION=$(grep -m1 '^version = "' Cargo.toml | cut -d'"' -f2)
+          set -euo pipefail
+          # `|| true` so a non-matching grep does not trip `set -e` before the
+          # explicit check below can emit an annotation — an aborted step with
+          # no `::error::` is invisible in the PR's checks summary.
+          VERSION=$(grep -m1 '^version = "' Cargo.toml | cut -d'"' -f2 || true)
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Could not read 'version = \"...\"' from Cargo.toml."
+            exit 1
+          fi
           echo "Crate version: ${VERSION}"
-          if ! grep -q "^## \[${VERSION}\] - " CHANGELOG.md; then
+          # `grep -F` (fixed string) throughout: a version contains dots, and
+          # as a regex `.` matches any character, so `0.1.0` would also accept
+          # a heading for `0x1y0`. The trade-off is losing the `^` anchor,
+          # which -F cannot express — acceptable, since a false pass now needs
+          # the exact heading text to appear mid-line somewhere in the file.
+          if ! grep -qF -- "## [${VERSION}] - " CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no '## [${VERSION}] - ...' section."
             echo "Release PRs must roll [Unreleased] into [${VERSION}] before merge."
             exit 1
           fi
-          if ! grep -q "^\[${VERSION}\]: " CHANGELOG.md; then
+          if ! grep -qF -- "[${VERSION}]: " CHANGELOG.md; then
             echo "::error::CHANGELOG.md is missing the '[${VERSION}]: ...' link reference."
             echo "Release PRs must roll [Unreleased] into [${VERSION}] before merge."
             exit 1

@@ -15,7 +15,11 @@ cargo test scopes_parsed        # run a single test by name substring
 cargo test config::             # run all tests in one module
 cargo clippy --all-targets
 cargo fmt
+cargo deny check                # advisories + licenses + bans + sources (CI runs this)
+cargo deny check advisories     # just the RustSec database
 ```
+
+Supply chain: use `cargo deny check`, **not** `cargo audit`. The advisory policy — including the documented `RUSTSEC-2023-0071` (`rsa`) ignore and its re-evaluation triggers — lives in `deny.toml` at the repo root. `cargo audit` does not read that file (it used to read a since-deleted `.cargo/audit.toml`), so a bare `cargo audit` now exits non-zero on `rsa` with no visible justification. Install with `cargo install --locked cargo-deny`.
 
 Note: tests in `config.rs` mutate process env vars and are serialized via a `static ENV_LOCK: Mutex`. Any new test touching `OIDC_*` env vars must use the `with_required_env` helper (or take that lock) to avoid flaky parallel runs.
 

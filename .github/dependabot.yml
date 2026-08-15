@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  # The necessary counterpart to SHA-pinning every action in .github/workflows.
+  # Pinning to a commit SHA removes the tag-hijack risk but freezes the action
+  # forever: without an updater, a pinned action is a permanently-unpatched
+  # dependency that runs with repository credentials. Dependabot rewrites the
+  # SHA and the trailing `# vX.Y.Z` comment together, so the pins stay honest.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # The cargo half matters independently of the daily advisory cron in ci.yml,
+  # which can only report what RustSec knows about. `webpki-roots` is a
+  # vendored snapshot of the Mozilla CA root store (it arrives via
+  # openidconnect's `rustls-tls` feature): when Mozilla distrusts a CA, that is
+  # a data change, not a code vulnerability, so it never produces a RustSec
+  # advisory. Nothing but a version bump surfaces it.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
