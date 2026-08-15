@@ -1,9 +1,0 @@
-[advisories]
-ignore = [
-    # rsa 0.9 Marvin attack (timing sidechannel on private-key operations).
-    # No fixed release exists. Pulled in by openidconnect for JWT signature
-    # verification, which uses only RSA *public* keys — the vulnerable
-    # private-key decryption/signing paths are never exercised by this crate.
-    # Re-evaluate when rsa 0.10 ships.
-    "RUSTSEC-2023-0071",
-]

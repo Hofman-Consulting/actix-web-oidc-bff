@@ -1,0 +1,139 @@
+# cargo-deny configuration.
+#
+# Run locally with:
+#   cargo deny check              # advisories + licenses + bans + sources
+#   cargo deny check advisories   # just the RustSec database
+#
+# This crate is an OIDC relying party: it terminates the login flow, verifies
+# ID-token signatures and holds the session that stands in for a user's
+# identity. Every crate in the tree runs inside that trust boundary, so the
+# dependency graph is treated as part of the attack surface — a vulnerable,
+# unmaintained or unexpectedly-sourced transitive dependency is a release
+# blocker, not a warning.
+
+[graph]
+# The crate currently declares no `[features]`, so this is a no-op today. It is
+# set anyway so the config stays correct the moment a feature is added (e.g. an
+# alternative TLS backend) rather than silently checking only the default set.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Security advisories (RustSec)
+# ---------------------------------------------------------------------------
+[advisories]
+# Schema version 2. The old `vulnerability` / `unmaintained` / `notice` /
+# `severity-threshold` keys are gone: vulnerabilities and unsound/unmaintained
+# advisories are denied unconditionally, and anything tolerated must be listed
+# explicitly in `ignore` below with a justification.
+version = 2
+
+# Flag unmaintained crates anywhere in the tree, including transitively.
+unmaintained = "all"
+
+# Yanked crates mean the lockfile can no longer be reproduced. Hard failure.
+yanked = "deny"
+
+# Every entry needs a justification and a re-evaluation trigger. The sibling
+# paykit repo's copy of this file says "empty is the desired steady state" for
+# this list; this repo deliberately ships it non-empty from day one, because
+# `openidconnect` pulls in `rsa` transitively and there is no fixed release to
+# upgrade to.
+#
+# The structured `{ id, reason }` form is used rather than a bare advisory-ID
+# string so the justification lives in the tool's own output, not just in a
+# comment cargo-deny never reads. (`id` and `crate` are mutually exclusive
+# here — cargo-deny rejects a table carrying both — but `crate` is not needed:
+# a RustSec ID is issued against one specific crate, so RUSTSEC-2023-0071 can
+# only ever match `rsa`. The ignore is crate-pinned by construction.)
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = """
+rsa 0.9 Marvin attack: a timing sidechannel on RSA private-key operations.
+No fixed release exists (the fix lands in rsa 0.10, unreleased at time of
+writing). `rsa` is pulled in transitively by `openidconnect` for JWT signature
+verification, which uses only RSA *public* keys, so the vulnerable private-key
+decryption and signing paths are never exercised by this crate.
+
+Re-evaluate:
+  - when rsa 0.10 ships (drop this entry and bump), AND
+  - on ANY change that introduces RSA private-key use. The "public keys only"
+    premise is behavioural, not structural: openidconnect 4 also supports
+    `private_key_jwt` client authentication (signs a client assertion with an
+    RSA private key) and JWE-encrypted ID tokens (decrypts with an RSA private
+    key). Enabling either would put this crate squarely on the vulnerable path
+    and silently invalidate this ignore without changing the dependency graph.
+""" },
+]
+
+# ---------------------------------------------------------------------------
+# Licences
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+
+# Permissive licences only. Nothing copyleft, nothing with a source-disclosure
+# or network-use obligation, so downstream consumers can vendor this crate into
+# a closed-source application without a legal review.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# Require a high-confidence licence match; a fuzzy match on a hand-edited
+# licence file is not good enough to auto-approve.
+confidence-threshold = 0.93
+
+# Per-crate exceptions go here (crate name + the licence being allowed for it
+# alone). Prefer this over widening `allow` globally.
+exceptions = [
+    # CDLA-Permissive-2.0 is permissive: no copyleft, no source-disclosure and
+    # no network-use obligation, so it does not change the "vendorable into a
+    # closed-source app" property that `allow` above is protecting. It is not
+    # in the global list because it applies to *data*, not code: webpki-roots
+    # ships a snapshot of the Mozilla CA root store, and the licence covers
+    # that dataset. In this repo it arrives via `openidconnect`'s `reqwest` +
+    # `rustls-tls` features (see Cargo.toml): openidconnect -> oauth2 ->
+    # reqwest -> hyper-rustls -> webpki-roots. Note there is no direct reqwest
+    # dependency here to attribute it to — openidconnect owns the HTTP client,
+    # which is why `default-features = false` on it is load-bearing: the
+    # default build would bring native-tls instead.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate versions bloat the build and mean two copies of a crate to patch
+# when an advisory lands. Warn rather than deny: with the actix-web and reqwest
+# stacks in the tree this is largely outside our control.
+multiple-versions = "warn"
+
+# Wildcard version requirements make the lockfile meaningless.
+wildcards = "deny"
+
+# `highlight` makes the duplicate-version output show the shortest path to the
+# crate that pulled the extra copy in.
+highlight = "all"
+
+deny = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+# Only crates.io. A dependency served from an unknown registry or a git URL
+# has no yank mechanism and no advisory coverage.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

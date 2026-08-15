@@ -43,8 +43,9 @@ of progress toward a fix and coordinate disclosure timing with you.
 ## Known advisories
 
 - **RUSTSEC-2023-0071** (Marvin attack timing side-channel in the `rsa` crate)
-  is ignored in `.cargo/audit.toml`. This crate only performs RSA **public-key**
-  operations — verifying JWT/ID-token signatures — and never RSA private-key
-  operations, so the timing side-channel is not reachable here. This ignore must
-  be **re-evaluated** if RSA private-key operations are ever introduced (for
-  example, `private_key_jwt` client authentication).
+  is ignored in `deny.toml` (`[advisories] ignore`). This crate only performs
+  RSA **public-key** operations — verifying JWT/ID-token signatures — and never
+  RSA private-key operations, so the timing side-channel is not reachable here.
+  This ignore must be **re-evaluated** if RSA private-key operations are ever
+  introduced (for example, `private_key_jwt` client authentication or
+  JWE-encrypted ID tokens), and dropped once `rsa` 0.10 ships.
