@@ -7,8 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> Next release is **0.2.0**. It is a breaking release: configuration moves from
-> `OIDC_*` environment variables to `OidcBffConfig::builder()`.
+## [0.2.0] - 2026-08-18
+
+> **Breaking release.** Configuration moves from `OIDC_*` environment variables
+> to `OidcBffConfig::builder()`.
 
 > **Upgrading logs every user out, once.** Sessions created before this version
 > carry no login timestamp and are treated as expired by the new absolute
@@ -205,5 +207,6 @@ reach the browser.
 - Configuration from `OIDC_*` environment variables via
   `OidcBffConfig::from_env`.
 
-[Unreleased]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/releases/tag/v0.1.0
