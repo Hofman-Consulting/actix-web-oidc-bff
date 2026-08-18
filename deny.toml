@@ -65,6 +65,39 @@ Re-evaluate:
     key). Enabling either would put this crate squarely on the vulnerable path
     and silently invalidate this ignore without changing the dependency graph.
 """ },
+    { id = "RUSTSEC-2026-0258", reason = """
+h2 0.3 accepts and queues empty DATA frames without limit, so a peer that
+never lets streams drain can drive unbounded memory growth, or a panic if the
+queued length overflows. Rated low severity upstream.
+
+There is no version to upgrade to. The fix ships only in h2 0.4.16; 0.3.27 is
+the newest release on the 0.3 line and carries no backport. `h2` is pulled in
+by `actix-http`, which still declares `h2 ^0.3.27` as of 3.13.3 (the latest
+release at time of writing), and `http2` is one of actix-web's *default*
+features — so the whole actix-web 4.x line sits on the unpatched line and
+`cargo update` cannot move it.
+
+Scope: this is actix-http's server-side HTTP/2 implementation. This crate is a
+library that contributes routes to a consumer's actix-web app; the consumer
+runs the server, so the exposure belongs to their whole application rather
+than to these routes specifically. Deployments that terminate HTTP/2 at a
+reverse proxy or load balancer — the common shape for a BFF — never exercise
+actix-http's h2 at all, since the proxy speaks HTTP/1.1 to the app.
+
+Re-evaluate:
+  - when actix-web/actix-http ships a release depending on h2 >= 0.4.16
+    (expected to require an actix-web major bump) — drop this entry and
+    upgrade; OR
+  - if h2 backports the fix to 0.3.x — `cargo update -p h2` and drop this
+    entry.
+
+Deliberately NOT done: disabling actix-web's default `http2` feature would
+drop `h2` from this crate's lockfile and make cargo-deny pass, but Cargo
+features are additive across the dependency graph — any consumer enabling
+`http2` gets the vulnerable code back. That would silence the signal here
+without protecting a single real deployment, which is worse than carrying a
+documented ignore.
+""" },
 ]
 
 # ---------------------------------------------------------------------------
