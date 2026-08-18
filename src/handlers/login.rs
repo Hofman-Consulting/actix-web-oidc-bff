@@ -83,9 +83,9 @@ pub async fn login(
         .into_inner()
         .return_to
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| cfg.return_to_prefix.clone());
+        .unwrap_or_else(|| cfg.return_to_prefix().to_string());
 
-    if !validate_return_to(&return_to, &cfg.return_to_prefix) {
+    if !validate_return_to(&return_to, cfg.return_to_prefix()) {
         return Err(BffError::BadRequest("invalid return_to".to_string()));
     }
 
@@ -96,7 +96,7 @@ pub async fn login(
     // Filter `openid` from cfg.scopes: authorize_url auto-adds the openid
     // scope, so passing it again would duplicate it in the request URL.
     let scopes: Vec<Scope> = cfg
-        .scopes
+        .scopes()
         .iter()
         .filter(|s| s.as_str() != "openid")
         .map(|s| Scope::new(s.clone()))
@@ -125,7 +125,7 @@ pub async fn login(
         .and_then(Result::ok)
         .unwrap_or_default();
 
-    let pruned = prune_expired(existing, now, cfg.pre_auth_ttl_secs);
+    let pruned = prune_expired(existing, now, cfg.pre_auth_ttl_secs());
     let updated = push_pre_auth(
         pruned,
         PreAuthEntry {
@@ -159,27 +159,10 @@ mod tests {
 
     /// Build a minimal `OidcBffConfig` for tests without touching env vars.
     fn test_cfg() -> OidcBffConfig {
-        OidcBffConfig {
-            issuer_url: "https://idp.example.com".to_string(),
-            client_id: "test-client".to_string(),
-            client_secret: secrecy::SecretString::new("test-secret".to_owned()),
-            redirect_url: "https://app.example.com/auth/callback".to_string(),
-            session_key: actix_web::cookie::Key::generate(),
-            cookie_name: "__Host-oidc_bff_session".to_string(),
-            cookie_secure: true,
-            allowed_origin: "https://app.example.com".to_string(),
-            scopes: vec![
-                "openid".to_string(),
-                "profile".to_string(),
-                "email".to_string(),
-            ],
-            jwks_ttl_secs: 900,
-            pre_auth_ttl_secs: 600,
-            post_auth_ttl_secs: 43200,
-            return_to_prefix: "/".to_string(),
-            persist_claims: vec![],
-            post_logout_redirect_url: None,
-        }
+        crate::config::test_config_builder()
+            .scopes(["openid", "profile", "email"])
+            .build()
+            .unwrap()
     }
 
     fn test_rp() -> web::Data<OidcRp> {
@@ -543,11 +526,11 @@ mod tests {
         let req = actix_web::test::TestRequest::default().to_http_request();
         let session = req.get_session();
 
-        let cfg = {
-            let mut c = test_cfg();
-            c.return_to_prefix = "/app".to_string();
-            c
-        };
+        let cfg = crate::config::test_config_builder()
+            .scopes(["openid", "profile", "email"])
+            .return_to_prefix("/app")
+            .build()
+            .unwrap();
         // Validate that the prefix itself passes validation (sanity).
         assert!(
             validate_return_to("/app", "/app"),

@@ -14,6 +14,44 @@ pub(crate) const REFRESH_TOKEN: &str = "refresh_token";
 pub(crate) const ID_TOKEN: &str = "id_token";
 /// Session key for the list of extra claim names persisted by the callback.
 pub(crate) const CLAIM_KEYS: &str = "__bff_claim_keys";
+/// Session key holding the login time (Unix epoch seconds) of the current
+/// authenticated session.
+///
+/// Written by the callback immediately after `session.renew()` and used to
+/// enforce the absolute session lifetime
+/// (`OidcBffConfig::max_session_lifetime_secs()`, `pub(crate)`, not linkable
+/// from here; see the public [`crate::OidcBffConfig::max_session_lifetime()`])
+/// independently of the sliding/idle TTL. The `__bff_` prefix keeps it out of
+/// the OIDC claim namespace.
+pub(crate) const LOGIN_AT: &str = "__bff_login_at";
+
+/// Skew allowance (seconds) for accepting a [`LOGIN_AT`] timestamp slightly in
+/// the future (e.g. clock drift between instances). Beyond this a session is
+/// treated as dead, so a corrupt or hostile timestamp cannot buy an unbounded
+/// lifetime. Mirrors the negative-age rejection in [`prune_expired`].
+///
+/// Shared by `DbSessionStore` and the `Auth` extractor: both enforce the
+/// absolute lifetime, and they must agree on the edge cases.
+pub(crate) const LOGIN_AT_FUTURE_SKEW_SECS: i64 = 60;
+
+/// Interpret an already-deserialized [`LOGIN_AT`] value as epoch seconds.
+///
+/// `Session::insert` JSON-encodes values, so an `i64` round-trips as a bare
+/// JSON number while a `String` round-trips as a quoted JSON string. Both are
+/// accepted so that a type change at the write site cannot silently invalidate
+/// every live session.
+///
+/// **This is the single definition of that encoding contract.** `DbSessionStore`
+/// (which sees raw `HashMap<String, String>` values) and the `Auth` extractor
+/// (which sees a `Session`) both route through it; if they diverge, one of them
+/// destroys sessions the other considers valid.
+pub(crate) fn login_at_from_json(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
 /// Session key under which the `Vec<PreAuthEntry>` is stored.
 pub(crate) const PRE_AUTH: &str = "oidc_pre_auth";
 
@@ -37,6 +75,7 @@ pub(crate) const RESERVED_SESSION_KEYS: &[&str] = &[
     REFRESH_TOKEN,
     ID_TOKEN,
     CLAIM_KEYS,
+    LOGIN_AT,
     PRE_AUTH,
 ];
 
@@ -203,6 +242,7 @@ mod tests {
             REFRESH_TOKEN,
             ID_TOKEN,
             CLAIM_KEYS,
+            LOGIN_AT,
             PRE_AUTH,
         ] {
             assert!(

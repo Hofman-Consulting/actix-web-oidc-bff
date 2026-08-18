@@ -3,7 +3,8 @@
 //!
 //! ## Pieces
 //! - [`OidcBffConfig`] — runtime configuration (issuer, client credentials,
-//!   cookie/session settings), buildable from environment variables.
+//!   cookie/session settings), constructed via [`OidcBffConfig::builder`] /
+//!   [`OidcBffConfigBuilder`], which validates every field in `build()`.
 //! - [`OidcRp`] — the OIDC relying party: discovery, client construction, and
 //!   JWKS metadata refresh.
 //! - [`configure`] / [`configure_app_data`] — register the `/auth/*` routes and
@@ -38,7 +39,9 @@ pub(crate) mod session_state;
 /// [`DbSessionStore`].
 pub mod store;
 
-pub use config::{ConfigError, OidcBffConfig};
+pub use config::{
+    ConfigError, OidcBffConfig, OidcBffConfigBuilder, SessionExpiry, SessionExpiryParseError,
+};
 pub use csrf::ensure_same_origin;
 pub use error::BffError;
 pub use extractor::Auth;

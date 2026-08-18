@@ -11,7 +11,7 @@ use crate::error::BffError;
 use crate::oidc::{BffClient, OidcRp};
 use crate::session_state::{
     insert_or_internal, prune_expired, take_matching, ACCESS_TOKEN, CLAIM_KEYS, EMAIL, ID_TOKEN,
-    ISS, NAME, POST_AUTH_SCRUB_KEYS, PRE_AUTH, REFRESH_TOKEN, SUB,
+    ISS, LOGIN_AT, NAME, POST_AUTH_SCRUB_KEYS, PRE_AUTH, REFRESH_TOKEN, SUB,
 };
 
 /// Query parameters `GET /auth/callback` is invoked with by the IdP.
@@ -78,7 +78,7 @@ pub async fn callback(
         .unwrap_or_default();
 
     let now = chrono::Utc::now().timestamp();
-    let entries = prune_expired(entries, now, cfg.pre_auth_ttl_secs);
+    let entries = prune_expired(entries, now, cfg.pre_auth_ttl_secs());
 
     // (2) IdP signalled an error. If a `state` is present consume only the
     // matching pre-auth slot and write the remainder back; if no `state` is
@@ -180,7 +180,15 @@ pub async fn callback(
     // (8) Rotate session key to prevent session fixation.
     session.renew();
 
-    // (9) Scrub keys from any previous login. `renew()` keeps the session
+    // (9) Stamp the absolute session start time. This MUST happen
+    // immediately after `renew()` and before any of the fallible inserts
+    // below: `Auth::extract` (and `DbSessionStore`) treat `sub` present
+    // without `login_at` as a dead session, so no later failure path may
+    // leave the two out of sync. Deliberately not scrubbed by
+    // `POST_AUTH_SCRUB_KEYS` — every successful login overwrites it anyway.
+    insert_or_internal(&session, LOGIN_AT, &chrono::Utc::now().timestamp())?;
+
+    // (10) Scrub keys from any previous login. `renew()` keeps the session
     // state, so stale tokens and optional identity fields must be explicitly
     // removed before writing the new login's values.
     for key in POST_AUTH_SCRUB_KEYS {
@@ -194,7 +202,7 @@ pub async fn callback(
         session.remove(key);
     }
 
-    // (10) Standard claims.
+    // (11) Standard claims.
     let sub = claims.subject().to_string();
     let iss = claims.issuer().to_string();
     let email = claims.email().map(|e| e.to_string());
@@ -212,7 +220,7 @@ pub async fn callback(
         insert_or_internal(&session, NAME, name_val)?;
     }
 
-    // (11) Configurable extra claims. Serialize the entire claims struct to a
+    // (12) Configurable extra claims. Serialize the entire claims struct to a
     // flat JSON object and pick from it by name. This handles typed fields
     // (`amr`, `acr`, `preferred_username`) and `additional_claims` uniformly
     // without special-casing — the fixture test gates this approach.
@@ -222,14 +230,14 @@ pub async fn callback(
     })?;
 
     let mut persisted_keys: Vec<String> = Vec::new();
-    for (name, value) in select_claims(&claims_json, &cfg.persist_claims) {
+    for (name, value) in select_claims(&claims_json, cfg.persist_claims()) {
         insert_or_internal(&session, name, &value)?;
         persisted_keys.push(name.to_string());
     }
     insert_or_internal(&session, CLAIM_KEYS, &persisted_keys)?;
 
-    // (12) Server-side token storage. SENSITIVE: the session store must be
-    // encrypted at rest (or use DbSessionStore). Step 9 scrubbed any stale
+    // (13) Server-side token storage. SENSITIVE: the session store must be
+    // encrypted at rest (or use DbSessionStore). Step 10 scrubbed any stale
     // tokens from a previous login before writing these.
     insert_or_internal(
         &session,
@@ -380,23 +388,7 @@ mod tests {
     use actix_web::{test::TestRequest, web};
 
     fn test_cfg() -> OidcBffConfig {
-        OidcBffConfig {
-            issuer_url: "https://idp.example.com".to_string(),
-            client_id: "test-client".to_string(),
-            client_secret: secrecy::SecretString::new("test-secret".to_owned()),
-            redirect_url: "https://app.example.com/auth/callback".to_string(),
-            session_key: actix_web::cookie::Key::generate(),
-            cookie_name: "__Host-oidc_bff_session".to_string(),
-            cookie_secure: true,
-            allowed_origin: "https://app.example.com".to_string(),
-            scopes: vec!["openid".to_string()],
-            jwks_ttl_secs: 900,
-            pre_auth_ttl_secs: 600,
-            post_auth_ttl_secs: 43200,
-            return_to_prefix: "/".to_string(),
-            persist_claims: vec![],
-            post_logout_redirect_url: None,
-        }
+        crate::config::test_config()
     }
 
     fn test_rp() -> web::Data<OidcRp> {
@@ -619,5 +611,190 @@ mod tests {
             }
             other => panic!("expected BadRequest, got: {other:?}"),
         }
+    }
+
+    // ── Full success path against a local mock IdP (LOGIN_AT stamping) ─────────
+    //
+    // Unlike the error-path tests above, exercising a successful callback
+    // requires an actual token exchange and a signature-verifiable ID token.
+    // We stand up a throwaway actix-web server on a random local port to play
+    // the IdP's token endpoint, and sign a real ID token with a locally
+    // generated (test-only, never used anywhere else) RSA key whose public
+    // half is embedded directly into the provider metadata — no JWKS fetch
+    // needed.
+
+    use crate::oidc::BffProviderMetadata;
+    use openidconnect::core::{
+        CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
+        CoreRsaPrivateSigningKey,
+    };
+    use openidconnect::{
+        Audience, IdToken, IssuerUrl, JsonWebKeyId, PrivateSigningKey, StandardClaims,
+        SubjectIdentifier,
+    };
+
+    /// Test-only RSA private key (PKCS#1 PEM), generated solely for signing
+    /// mock ID tokens in this test module. Never used outside `#[cfg(test)]`.
+    const TEST_RSA_PRIV_KEY_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAsz4+Sdz8g9PKOq0EVcEdOcJsrera0dwKK+Bijsp5TkSH9BtO
+2r8MvovVUlKhmS4zLqI/J2Ls4F0hs2YIQczOG/YhOBTTi9aSewtTmmpFgTjzKnT5
+guDyS32YBAiawUB0pFDmCk6TcQGtGORqafj0e2rkHO0iyjCIreFvMO2mNmom0NcR
+j4XqGaX8Vah75J0edLyAFC+McJNiehYm/wh4DZ4ekAcicblbWHxZlDazNyXoELlI
+/tVQvEvecygJo2wmHZ7vE5UAoIXLFzYKj6jtSk13LtJOX1Z2KqKJxKapFWLfy+NV
+wM1d2IAcytNj3dFuKpnPSdPlYNQ1AhAmmR3lPQIDAQABAoIBAA7mdbceL7+ls4H9
+MAcQ7qUGjJJIm7gmWpIbLRZBrqPa/pJEUuHMT/rnFOyrAdQCCy8tPaLAjoB4PXz0
+Vmth4yBf7ZMD6DIPvE2OO3zyqKR9X3mAD93ZZUrxPdnX/UVjXk7qirUAozEZupH/
+Kvl0QJ6h3CSrceDs9++8dcnTd6W+OX8BwG/0+jhwzLf3PVaCcvHOXGWHBMkcBRCw
+Axy6a2yb4FNEsU1PIBWRQ4e5COPkuK6sJSWoL54HiTunLnGbFq8PAkbFt/YilAVD
++7/71jJKJx4olcRDjo6SRHFYUIg5YA5KN0tSpZLsyRw7PX5Z9Rl9AyFjQu/TlZ9G
+XMIwqQECgYEA7TbN563DGhzEGqlskPupWf7dBkZOJnuR0lWqZ5JW8/ZCd/19uFGd
+XfaBQXfumdk+k+NoLWyty9cP6sjY/wOdLu0jXBWf1/uRNLBsrLtBd+sUvp7agypg
+fsWjE1L6whXJRtRpUdiITlskrRk1dExZXD2lM5PFaL0XL+Dp0YH29XUCgYEAwXAo
+A9V6KHMnj0+SgWIB++V1jStS0RZsyQ+Bv5PnpBcD1Hl9i90tB0/fmcF4kE0ZfJ3d
+hX67YgTZ3zdCKWmaswwgihMCYBle3vYC1Y+hb3IARGOfpQLmzBBgrwmx1C1fUS6h
+OWc9H8SrsW5/yAWnRgQpxYNiHQLqQAOkE0dkD6kCgYEA1mdZllTM6jYj3cFSunxs
+pkYgugIjss6vj4AUZEa1xw3HKDL7RfSmmv4p9+WRyIa98+dwCtaXA43f+iMNVvmK
+QZbfBeUZs5rStN/dagZadywIdP6ZnEJaM1spOVcgBPqyEQ3+H5bqJIBm1vnZAcPc
+ZO3m+oZOwItggMr2K4Ifl90CgYAh1ABbc0jSrBi9+jdvwvj/2UfucSYhhJ9vpfOV
+0kLPMmssDDcFb5+BSNmcpPX1nlYXse/ceaZBZQHJBHvgjCROrY8/NkXTEnzB1xn1
+yRF9UN11GEsB63j7NN4Dnlln9qtVoib1x/UrihRQijd0fnCbUP0RGoHc+vaGTVyz
+NmfsSQKBgQCh6J8neOGXDyQlOQpw/EOJr98IsQgXoFAuKsxGcdFLb4QRJDMgqPL1
+xIT9GuH/OOSm+Ic7emF7/ZxN5kMlbZAHMBzlbHxImfVeJeXJwx++AvJUM5obtU2l
+bE8H4uDeKnYSVMjktEb+/QCQ0Q0hS5Qkv916Ur9vaLCzFZllE/e49w==
+-----END RSA PRIVATE KEY-----";
+
+    fn test_signing_key() -> CoreRsaPrivateSigningKey {
+        CoreRsaPrivateSigningKey::from_pem(
+            TEST_RSA_PRIV_KEY_PEM,
+            Some(JsonWebKeyId::new("test-key".to_string())),
+        )
+        .expect("test RSA key must parse")
+    }
+
+    /// Build provider metadata pointing at a local mock token endpoint, with
+    /// the test signing key's public half embedded directly (bypassing a
+    /// JWKS-URI fetch entirely).
+    fn metadata_for_mock_idp(token_endpoint: &str) -> BffProviderMetadata {
+        let raw = json!({
+            "issuer": "https://idp.example.com",
+            "authorization_endpoint": "https://idp.example.com/oauth2/authorize",
+            "token_endpoint": token_endpoint,
+            "jwks_uri": "https://idp.example.com/oauth2/jwks",
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        });
+        let metadata: BffProviderMetadata =
+            serde_json::from_value(raw).expect("mock IdP metadata must be valid");
+        metadata.set_jwks(CoreJsonWebKeySet::new(vec![
+            test_signing_key().as_verification_key()
+        ]))
+    }
+
+    /// Sign a minimal, valid ID token matching `OidcRp::for_tests`' client
+    /// ("test-client") and the mock IdP's issuer, carrying `nonce`.
+    fn sign_id_token(nonce: &str) -> String {
+        let now = chrono::Utc::now();
+        let claims = IdTokenClaims::<BffAdditionalClaims, CoreGenderClaim>::new(
+            IssuerUrl::new("https://idp.example.com".to_string()).unwrap(),
+            vec![Audience::new("test-client".to_string())],
+            now + chrono::Duration::hours(1),
+            now,
+            StandardClaims::new(SubjectIdentifier::new("test-user".to_string())),
+            BffAdditionalClaims::default(),
+        )
+        .set_nonce(Some(Nonce::new(nonce.to_string())));
+
+        let id_token: IdToken<
+            BffAdditionalClaims,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        > = IdToken::new(
+            claims,
+            &test_signing_key(),
+            CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+            None,
+            None,
+        )
+        .expect("id token must sign");
+        id_token.to_string()
+    }
+
+    /// Start a throwaway HTTP server on a random local port that always
+    /// answers `POST /token` with a fixed token response body. Returns the
+    /// server's base URL.
+    async fn start_mock_token_endpoint(id_token_jwt: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+        let body = json!({
+            "access_token": "test-access-token",
+            "token_type": "bearer",
+            "id_token": id_token_jwt,
+        });
+        let server = actix_web::HttpServer::new(move || {
+            let body = body.clone();
+            actix_web::App::new().route(
+                "/token",
+                web::post().to(move || {
+                    let body = body.clone();
+                    async move { HttpResponse::Ok().json(body) }
+                }),
+            )
+        })
+        .listen(listener)
+        .expect("listen must succeed")
+        .run();
+        actix_web::rt::spawn(server);
+        format!("http://{addr}")
+    }
+
+    /// After a full, successful callback (real token exchange + ID-token
+    /// signature verification against the mock IdP) the session must contain
+    /// `LOGIN_AT` stamped with a timestamp taken during the call.
+    #[actix_web::test]
+    async fn successful_callback_stamps_login_at() {
+        let nonce = "mock-nonce";
+        let jwt = sign_id_token(nonce);
+        let base_url = start_mock_token_endpoint(jwt).await;
+        let metadata = metadata_for_mock_idp(&format!("{base_url}/token"));
+        let rp = web::Data::new(OidcRp::for_tests(metadata));
+
+        let req = TestRequest::default().to_http_request();
+        let session = req.get_session();
+        let started_at = chrono::Utc::now().timestamp();
+        session
+            .insert(
+                PRE_AUTH,
+                vec![PreAuthEntry {
+                    state: "state-1".to_string(),
+                    pkce_verifier: "verifier".to_string(),
+                    nonce: nonce.to_string(),
+                    return_to: "/".to_string(),
+                    started_at,
+                }],
+            )
+            .unwrap();
+
+        let before = chrono::Utc::now().timestamp();
+        let result = callback(
+            session.clone(),
+            query(Some("test-code"), Some("state-1"), None),
+            rp,
+            web::Data::new(test_cfg()),
+        )
+        .await;
+        let after = chrono::Utc::now().timestamp();
+
+        result.expect("callback must succeed against the mock IdP");
+
+        let login_at: i64 = session
+            .get(LOGIN_AT)
+            .expect("session read must not error")
+            .expect("LOGIN_AT must be present after a successful callback");
+        assert!(
+            (before..=after).contains(&login_at),
+            "login_at {login_at} must fall within the call window [{before}, {after}]"
+        );
     }
 }
