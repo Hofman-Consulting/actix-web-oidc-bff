@@ -70,7 +70,7 @@ pub enum DiscoveryError {
 /// Only this type is ever used as the `AC` generic parameter inside the crate.
 /// It is intentionally **not** exposed as a generic parameter in any public
 /// handler or extractor — consumers configure which keys to persist via
-/// [`OidcBffConfig::persist_claims`].
+/// [`OidcBffConfig::persist_claims()`].
 ///
 /// The inner `HashMap` field uses `#[serde(flatten)]` so that, when this
 /// struct is embedded inside an `IdTokenClaims<…>`, every extra key-value pair
@@ -223,7 +223,7 @@ impl OidcRp {
     /// Note: PKCE S256 is enforced unconditionally at login time via
     /// `PkceCodeChallenge::new_random_sha256()`.
     pub async fn discover(cfg: &OidcBffConfig) -> Result<Self, DiscoveryError> {
-        let issuer = IssuerUrl::new(cfg.issuer_url.clone())
+        let issuer = IssuerUrl::new(cfg.issuer_url().to_owned())
             .map_err(|e| DiscoveryError::InvalidIssuerUrl(e.to_string()))?;
 
         // Redirects MUST stay disabled: following them from the token/JWKS
@@ -247,9 +247,9 @@ impl OidcRp {
             return Err(DiscoveryError::NoAsymmetricAlg(format!("{supported:?}")));
         }
 
-        let client_id = ClientId::new(cfg.client_id.clone());
-        let client_secret = ClientSecret::new(cfg.client_secret.expose_secret().to_owned());
-        let redirect_url = RedirectUrl::new(cfg.redirect_url.clone())
+        let client_id = ClientId::new(cfg.client_id().to_owned());
+        let client_secret = ClientSecret::new(cfg.client_secret().expose_secret().to_owned());
+        let redirect_url = RedirectUrl::new(cfg.redirect_url().to_owned())
             .map_err(|e| DiscoveryError::InvalidRedirectUrl(e.to_string()))?;
 
         let client = build_client(
@@ -264,7 +264,7 @@ impl OidcRp {
             client_secret,
             redirect_url,
             inner: Arc::new(RwLock::new(RpInner { metadata, client })),
-            jwks_ttl: Duration::from_secs(cfg.jwks_ttl_secs),
+            jwks_ttl: Duration::from_secs(cfg.jwks_ttl_secs()),
             last_refresh: RwLock::new(Instant::now()),
             last_forced_refresh: RwLock::new(None),
             http_client,
@@ -278,7 +278,7 @@ impl OidcRp {
 
     /// Return a cached [`BffClient`] wrapped in an [`Arc`], transparently
     /// refreshing the metadata (and thus the JWKS) when it is older than
-    /// [`OidcBffConfig::jwks_ttl_secs`].
+    /// `OidcBffConfig::jwks_ttl_secs()` (`pub(crate)`, not linkable from here).
     ///
     /// The returned client carries [`BffAdditionalClaims`] so that arbitrary
     /// extra ID-token claims are preserved for selective session persistence.

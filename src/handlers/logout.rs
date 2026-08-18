@@ -38,7 +38,7 @@ pub async fn logout(
     cfg: web::Data<OidcBffConfig>,
 ) -> Result<HttpResponse, BffError> {
     // 1. CSRF — compare against the pre-computed ASCII origin.
-    ensure_same_origin_against(&req, &cfg.allowed_origin)?;
+    ensure_same_origin_against(&req, cfg.allowed_origin())?;
 
     // 2. Read tokens BEFORE purging — they are gone after session.purge().
     let id_token_hint: Option<String> = session.get::<String>(ID_TOKEN).ok().flatten();
@@ -96,8 +96,8 @@ fn build_end_session_url(
         if let Some(hint) = id_token_hint {
             pairs.append_pair("id_token_hint", hint);
         }
-        pairs.append_pair("client_id", &cfg.client_id);
-        if let Some(post_logout) = &cfg.post_logout_redirect_url {
+        pairs.append_pair("client_id", cfg.client_id());
+        if let Some(post_logout) = cfg.post_logout_redirect_url() {
             pairs.append_pair("post_logout_redirect_uri", post_logout);
         }
     }
@@ -158,7 +158,7 @@ async fn revoke_best_effort(
     // is configured with an https redirect URL (the most common production case).
     // An attacker that can redirect the revocation request via http could observe
     // the token in transit.
-    if cfg.cookie_secure && !endpoint_is_https(endpoint_str) {
+    if cfg.cookie_secure() && !endpoint_is_https(endpoint_str) {
         log::warn!(
             "Skipping revocation: endpoint {endpoint_str:?} is not HTTPS \
              but the issuer redirect URL uses HTTPS"
@@ -206,23 +206,7 @@ mod tests {
 
     /// Build a minimal `OidcBffConfig` for use in tests without hitting env vars.
     fn test_cfg() -> OidcBffConfig {
-        OidcBffConfig {
-            issuer_url: "https://idp.example.com".to_string(),
-            client_id: "test-client".to_string(),
-            client_secret: secrecy::SecretString::new("test-secret".to_owned()),
-            redirect_url: "https://app.example.com/auth/callback".to_string(),
-            session_key: actix_web::cookie::Key::generate(),
-            cookie_name: "__Host-oidc_bff_session".to_string(),
-            cookie_secure: true,
-            allowed_origin: "https://app.example.com".to_string(),
-            scopes: vec!["openid".to_string()],
-            jwks_ttl_secs: 900,
-            pre_auth_ttl_secs: 600,
-            post_auth_ttl_secs: 43200,
-            return_to_prefix: "/".to_string(),
-            persist_claims: vec![],
-            post_logout_redirect_url: None,
-        }
+        crate::config::test_config()
     }
 
     /// Build a TestRequest with the given headers.
@@ -368,8 +352,10 @@ mod tests {
         let metadata = OidcRp::test_metadata(extra);
         let rp = web::Data::new(OidcRp::for_tests(metadata));
 
-        let mut cfg = test_cfg();
-        cfg.post_logout_redirect_url = Some("https://app.example.com/".to_string());
+        let cfg = crate::config::test_config_builder()
+            .post_logout_redirect_url("https://app.example.com/")
+            .build()
+            .unwrap();
         let cfg = web::Data::new(cfg);
 
         let req = req_with(&[("Sec-Fetch-Site", "same-origin")]);
@@ -522,9 +508,16 @@ mod tests {
         let rp = web::Data::new(OidcRp::for_tests(metadata));
 
         // Use an http (non-secure) config so the https-guard doesn't block.
-        let mut cfg = test_cfg();
-        cfg.cookie_secure = false;
-        cfg.allowed_origin = "http://app.example.com".to_string();
+        // cookie_secure is derived from redirect_url's scheme, so build from
+        // an http redirect_url rather than trying to set the field directly.
+        let cfg = crate::config::test_config_builder()
+            .redirect_url("http://app.example.com/auth/callback")
+            .build()
+            .unwrap();
+        assert!(
+            !cfg.cookie_secure(),
+            "sanity: http redirect_url must yield cookie_secure == false"
+        );
         let cfg = web::Data::new(cfg);
 
         let req = req_with(&[("Sec-Fetch-Site", "same-origin")]);

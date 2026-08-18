@@ -8,7 +8,7 @@ use crate::error::BffError;
 ///
 /// `allowed_origin` is a full URL whose origin (scheme + host + port) defines
 /// the application's public origin — the crate passes
-/// [`crate::OidcBffConfig::redirect_url`], which necessarily lives on the
+/// [`crate::OidcBffConfig::redirect_url()`], which necessarily lives on the
 /// app's public origin.
 ///
 /// Checks, in order:
@@ -28,8 +28,11 @@ pub fn ensure_same_origin(req: &HttpRequest, allowed_origin: &str) -> Result<(),
 ///
 /// Equivalent to [`ensure_same_origin`] but accepts the pre-computed ASCII
 /// origin (as produced by `Origin::Tuple(..).ascii_serialization()`) rather
-/// than a full URL. Use [`crate::OidcBffConfig::allowed_origin`] here to
-/// avoid re-parsing the redirect URL on every request.
+/// than a full URL. `OidcBffConfig::allowed_origin()` is `pub(crate)` and not
+/// reachable by external consumers of [`ensure_same_origin`]; the crate's own
+/// logout handler uses it internally as a fast path. External callers of the
+/// public [`ensure_same_origin`] should pass [`crate::OidcBffConfig::redirect_url()`]
+/// instead — it is re-parsed once per call, which is fine outside a hot path.
 pub(crate) fn ensure_same_origin_against(
     req: &HttpRequest,
     expected: &str,
