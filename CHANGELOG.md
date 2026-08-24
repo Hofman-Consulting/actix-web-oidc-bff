@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Extra authorization-request parameters.** `ExtraAuthParams` +
+  `login_route(params)` register additional login routes that run the same
+  authorization-code + PKCE flow while sending a fixed set of extra parameters
+  to the provider — `prompt=create` for a sign-up route, a provider-specific
+  Application-Initiated Action for a "change password" route, and so on.
+  `GET /auth/login` is completely unchanged when no variant is registered.
+  Parameters are added through `openidconnect`'s typed `add_extra_param`, so
+  they are correctly URL-encoded. `ExtraAuthParams::new` validates at
+  construction time and fails with `AuthParamError`: at most
+  `MAX_EXTRA_AUTH_PARAMS` (8) entries, values at most
+  `MAX_EXTRA_AUTH_VALUE_LEN` (512) bytes and free of control characters, no
+  duplicate names, and a deny-list covering every name the crate sets itself (`client_id`,
+  `redirect_uri`, `response_type`, `scope`, `state`, `nonce`,
+  `code_challenge`, `code_challenge_method`), `response_mode` (it would move
+  the response off the query string and break the `GET` callback),
+  `request`/`request_uri` (a JAR blob replaces the whole request), and
+  credentials (`client_secret`, `client_assertion*`, `code_verifier`).
+  Parameter values are meant to be application constants supplied at startup —
+  deriving one from the incoming request turns the login endpoint into an
+  authorization-request injection point. That rule is documentation-enforced,
+  not type-enforced. See the README's "Login variants" section and
+  `examples/login_variants.rs`.
+- **Verified re-authentication.** `ExtraAuthParams::require_auth_within(max_age)`
+  (with an `auth_max_age()` getter) makes a login variant demand a fresh
+  authentication *and* proves it happened. It sends `max_age` on the
+  authorization request through `openidconnect`'s typed setter — the provider is
+  where the re-prompt is enforced — records the requirement in the pre-auth slot,
+  and then verifies the returned ID token's `auth_time` claim in the callback,
+  rejecting the login with `400` and **no session established** when the claim is
+  stale or absent. An absent claim fails closed: OIDC Core makes `auth_time`
+  REQUIRED when the request carried `max_age`, so its absence means the provider
+  did not honour the request, which is exactly the silent downgrade this catches.
+  The age is measured from the **authorization request**, not from callback
+  arrival — that is what the provider evaluated, so time the user spends at the
+  provider afterwards (consent, or the very action the variant asked for) is not
+  charged against the budget; total flow duration stays bounded by
+  `pre_auth_ttl`. `AUTH_TIME_SKEW_SECS` (60) absorbs clock drift between the two
+  machines in both directions, so the effective window is `max_age + 60s`;
+  `Duration::ZERO` is legal and meaningful. When a requirement is set and the
+  session already holds a subject, a callback returning a **different** subject
+  is rejected rather than silently switching accounts — plain login routes are
+  unaffected, since logging in as someone else is what they are for. Note the
+  check gates the *login*, not the session: it is a precondition on completing
+  that login, not a lasting "stepped up" marker, so a handler that needs to make
+  a decision on freshness should `persist_claims(["auth_time"])` and check it. A sub-second `Duration` (rejected, not truncated — matching the
+  crate's TTL handling) or one above `MAX_AUTH_AGE_SECS` (365 days) is the new
+  `AuthParamError::InvalidMaxAge`. Correspondingly, **`max_age` is deny-listed as
+  a raw parameter**: `ExtraAuthParams::new([("max_age", "300")])` now fails with
+  `AuthParamError::ReservedName`. That entry is not about danger — a hand-rolled
+  `max_age` sends the request and verifies nothing, leaving a provider that
+  ignored it indistinguishable from one that honoured it, so denying the raw name
+  makes the verified path the only path. `acr_values` and a bare `prompt=login`
+  remain transmitted-but-unverified; there is no machine-checkable postcondition
+  for "the user was prompted" the way `auth_time` is one for `max_age`, so
+  `persist_claims(["acr"])` plus an application-side check is still the answer
+  there.
+- **Callback parameter passthrough.** `callback_passthrough_params(..)` on the
+  builder (with a `callback_passthrough_params()` getter) allowlists
+  query-parameter names that, when the IdP sends them on the callback request,
+  are appended percent-encoded to the post-login redirect URL — the way a
+  provider reports the outcome of an Application-Initiated Action to the page
+  the user lands on. Default is empty, which is exactly the previous behaviour.
+  Success path only: an IdP `error=` response returns 400 and never redirects.
+  A value is dropped, with a warning naming the parameter and never the value,
+  when it exceeds `MAX_PASSTHROUGH_VALUE_LEN` (256) bytes, contains control
+  characters, or contains `U+FFFD` (percent-decoding is lossy, so invalid UTF-8
+  arrives as the replacement character rather than as an error). Only the first
+  occurrence of a repeated name is considered and the drop decision is final; a
+  name already present in the `return_to` query is skipped; the appended
+  parameters are bounded in aggregate by `MAX_PASSTHROUGH_TOTAL_LEN` (1024)
+  encoded bytes, skipping a pair that does not fit rather than stopping. `build()` rejects more than `MAX_PASSTHROUGH_PARAMS` (8) names,
+  names outside `[A-Za-z0-9_.-]`, duplicates, and the deny-listed `code`,
+  `state`, `error`/`error_description`/`error_uri`, `iss`, `session_state`,
+  token names, and client credentials — forwarding any of those would expose
+  them in browser history, the `Referer` header, and access logs. Failures are
+  the new `ConfigError::InvalidPassthroughParam`. Forwarded values are
+  untrusted input: display data only, never a redirect target or an
+  authorization input.
+
+### Changed
+
+> **Breaking (source-level) for callers that invoke the callback handler
+> directly.** `handlers::callback::callback` gains an `HttpRequest` as its
+> first argument, so it can read the IdP's callback query string for the
+> passthrough allowlist. Applications that register the routes with
+> `configure()` — the documented path — are unaffected and need no change;
+> only code that names the handler itself (a hand-rolled
+> `web::resource("/auth/callback").route(web::get().to(callback))`) has to be
+> updated.
+
 ## [0.2.0] - 2026-08-18
 
 > **Breaking release.** Configuration moves from `OIDC_*` environment variables

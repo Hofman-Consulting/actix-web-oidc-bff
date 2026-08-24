@@ -9,6 +9,9 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 use crate::handlers::login::validate_return_to;
+use crate::param_names::{
+    validate_param_name, ParamNameError, DENIED_PASSTHROUGH_PARAMS, MAX_PARAM_NAME_LEN,
+};
 use crate::session_state::RESERVED_SESSION_KEYS;
 
 /// Errors returned by [`OidcBffConfigBuilder::build`].
@@ -51,6 +54,12 @@ pub enum ConfigError {
     /// exceeded `max_session_lifetime`.
     #[error("Invalid session TTL: {0}")]
     InvalidTtl(String),
+    /// A `callback_passthrough_params` entry was malformed, duplicated, or
+    /// named a parameter that must never be forwarded into a browser-visible
+    /// URL (the authorization code, a token, `state`, …), or more than
+    /// [`MAX_PASSTHROUGH_PARAMS`] entries were supplied.
+    #[error("Invalid callback passthrough parameter: {0}")]
+    InvalidPassthroughParam(String),
 }
 
 /// Runtime configuration for the OIDC relying party and session cookie.
@@ -137,6 +146,14 @@ pub struct OidcBffConfig {
     /// Optional; when set it is sent as `post_logout_redirect_uri` and must
     /// be registered at the IdP.
     post_logout_redirect_url: Option<String>,
+    /// Query-parameter names that, when present on the IdP's callback
+    /// request, are appended to the post-login redirect URL.
+    ///
+    /// Empty by default, which is exactly the pre-0.3 behaviour: the callback
+    /// redirects to the stored `return_to` untouched. See
+    /// [`Self::callback_passthrough_params`] for the trust model — the values
+    /// are untrusted input and reach the application's own query string.
+    callback_passthrough_params: Vec<String>,
 }
 
 /// OIDC validation-artifact claim names that must not be persisted into the
@@ -170,6 +187,15 @@ pub const DEFAULT_MAX_SESSION_LIFETIME_SECS: i64 = 7 * 24 * 3600;
 /// instead of seconds) than an intentional year-plus-lived session, and an
 /// unbounded TTL defeats the point of having one at all.
 pub const MAX_TTL_SECS: i64 = 365 * 24 * 3600;
+
+/// Maximum number of entries accepted by
+/// [`OidcBffConfigBuilder::callback_passthrough_params`].
+///
+/// The cap exists because every allowlisted parameter that the IdP actually
+/// sends is appended to the post-login `Location` header, and some proxies and
+/// older clients cap URLs around 2 KB. Eight names is far more feedback than
+/// any real post-login flow needs.
+pub const MAX_PASSTHROUGH_PARAMS: usize = 8;
 
 /// Determines whether [`OidcBffConfig::post_auth_ttl()`] is an absolute
 /// expiry from login or a sliding expiry that resets on every authenticated
@@ -292,6 +318,20 @@ impl OidcBffConfig {
     #[must_use]
     pub fn persist_claims(&self) -> &[String] {
         &self.persist_claims
+    }
+
+    /// Query-parameter names forwarded from the IdP's callback request onto
+    /// the post-login redirect URL. Empty by default.
+    ///
+    /// **The forwarded values are untrusted.** They arrive on the callback
+    /// request and are appended, percent-encoded, to the application's own
+    /// query string; the crate validates their shape but knows nothing about
+    /// their meaning. Never render them into HTML unescaped, and never use one
+    /// as a redirect target or an authorization input.
+    #[inline]
+    #[must_use]
+    pub fn callback_passthrough_params(&self) -> &[String] {
+        &self.callback_passthrough_params
     }
 
     /// Scopes to request from the IdP.
@@ -450,6 +490,7 @@ pub struct OidcBffConfigBuilder {
     session_key_source: Option<SessionKeySource>,
     scopes: Option<Vec<String>>,
     persist_claims: Option<Vec<String>>,
+    callback_passthrough_params: Option<Vec<String>>,
     return_to_prefix: Option<String>,
     post_logout_redirect_url: Option<String>,
     pre_auth_ttl: Option<Duration>,
@@ -588,6 +629,40 @@ impl OidcBffConfigBuilder {
     #[must_use]
     pub fn persist_claims(mut self, claims: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.persist_claims = Some(claims.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Query-parameter names to forward from the IdP's callback request onto
+    /// the post-login redirect URL. Defaults to empty, which is exactly the
+    /// pre-0.3 behaviour.
+    ///
+    /// The motivating case is post-login feedback: an identity provider that
+    /// redirects back with, say, `some_action_status=success` after a
+    /// credential change can only tell the application about it through the
+    /// callback URL, and the callback otherwise discards everything but
+    /// `code` and `state`. Allowlisting the name forwards it to the page the
+    /// user lands on.
+    ///
+    /// Only the **success** path forwards anything: an IdP `error=` response
+    /// returns a `400` and never redirects, so nothing is appended there.
+    ///
+    /// **Forwarded values are untrusted** — see
+    /// [`OidcBffConfig::callback_passthrough_params`]. Prefer namespaced names
+    /// (an `idp_` prefix, say) so a forwarded value can never collide with one
+    /// of the application's own query parameters.
+    ///
+    /// Entries are trimmed and empties dropped at [`Self::build`] time, where
+    /// malformed names, duplicates, names that must never reach a
+    /// browser-visible URL, and more than [`MAX_PASSTHROUGH_PARAMS`] entries
+    /// are all rejected. Repeat calls replace, they do not append — a second
+    /// call must not be able to smuggle a denied name past the first call's
+    /// (deferred) validation.
+    #[must_use]
+    pub fn callback_passthrough_params(
+        mut self,
+        params: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.callback_passthrough_params = Some(params.into_iter().map(Into::into).collect());
         self
     }
 
@@ -780,6 +855,10 @@ impl OidcBffConfigBuilder {
             }
         }
 
+        // ---- callback_passthrough_params ----
+        let callback_passthrough_params =
+            normalize_passthrough_params(self.callback_passthrough_params)?;
+
         // ---- post_logout_redirect_url (depends on cookie_secure) ----
         let post_logout_redirect_url = match self.post_logout_redirect_url {
             None => None,
@@ -878,8 +957,75 @@ impl OidcBffConfigBuilder {
             return_to_prefix,
             persist_claims,
             post_logout_redirect_url,
+            callback_passthrough_params,
         })
     }
+}
+
+/// Normalize and validate a builder-supplied callback-passthrough allowlist.
+///
+/// Entries are trimmed and empties dropped (so a list assembled from optional
+/// sources doesn't need pre-filtering), then each surviving name must pass
+/// [`validate_param_name`] against [`DENIED_PASSTHROUGH_PARAMS`] and be unique
+/// within the list. The count is checked **after** normalization, so dropped
+/// empties don't consume the budget.
+fn normalize_passthrough_params(params: Option<Vec<String>>) -> Result<Vec<String>, ConfigError> {
+    let names: Vec<String> = params
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if names.len() > MAX_PASSTHROUGH_PARAMS {
+        return Err(ConfigError::InvalidPassthroughParam(format!(
+            "at most {MAX_PASSTHROUGH_PARAMS} callback_passthrough_params are allowed, got {}",
+            names.len()
+        )));
+    }
+
+    for (i, name) in names.iter().enumerate() {
+        match validate_param_name(name, DENIED_PASSTHROUGH_PARAMS) {
+            Ok(()) => {}
+            Err(ParamNameError::Empty) => {
+                // Unreachable: empties were filtered above. Handled rather
+                // than `unreachable!()` so a future change to the filter
+                // cannot turn this into a panic in a consumer's startup path.
+                return Err(ConfigError::InvalidPassthroughParam(
+                    "callback_passthrough_params must not contain empty names".to_string(),
+                ));
+            }
+            Err(ParamNameError::TooLong) => {
+                return Err(ConfigError::InvalidPassthroughParam(format!(
+                    "callback_passthrough_params name must be at most \
+                     {MAX_PARAM_NAME_LEN} bytes, got {} bytes",
+                    name.len()
+                )));
+            }
+            Err(ParamNameError::InvalidCharset) => {
+                return Err(ConfigError::InvalidPassthroughParam(format!(
+                    "callback_passthrough_params name {name:?} must contain only \
+                     ASCII letters, digits, '_', '.', or '-'"
+                )));
+            }
+            Err(ParamNameError::Denied) => {
+                return Err(ConfigError::InvalidPassthroughParam(format!(
+                    "callback_passthrough_params must not contain {name:?}: forwarding it \
+                     into the post-login URL would expose it in browser history, the \
+                     Referer header, and access logs; denied names: \
+                     {DENIED_PASSTHROUGH_PARAMS:?}"
+                )));
+            }
+        }
+
+        if names[..i].iter().any(|earlier| earlier == name) {
+            return Err(ConfigError::InvalidPassthroughParam(format!(
+                "callback_passthrough_params contains {name:?} more than once"
+            )));
+        }
+    }
+
+    Ok(names)
 }
 
 /// Normalize a builder-supplied scope list.
@@ -1847,6 +1993,137 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid session expiry \"on_every_request\": expected \"fixed\" or \"sliding\""
+        );
+    }
+
+    // ── callback_passthrough_params ─────────────────────────────────────────
+
+    use super::{ConfigError, MAX_PASSTHROUGH_PARAMS};
+    use crate::param_names::{DENIED_PASSTHROUGH_PARAMS, MAX_PARAM_NAME_LEN};
+
+    /// Unconfigured is the pre-0.3 behaviour: nothing is forwarded.
+    #[test]
+    fn callback_passthrough_params_default_empty() {
+        assert!(test_config().callback_passthrough_params().is_empty());
+    }
+
+    #[test]
+    fn callback_passthrough_params_are_trimmed_and_empties_dropped() {
+        let cfg = test_config_builder()
+            .callback_passthrough_params(["  kc_action  ", "", "   ", "kc_action_status"])
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.callback_passthrough_params(),
+            ["kc_action", "kc_action_status"]
+        );
+    }
+
+    /// Repeat calls replace rather than append — otherwise a second call could
+    /// smuggle a denied name past the first call's deferred validation.
+    #[test]
+    fn callback_passthrough_params_repeat_call_replaces() {
+        let cfg = test_config_builder()
+            .callback_passthrough_params(["first"])
+            .callback_passthrough_params(["second"])
+            .build()
+            .unwrap();
+        assert_eq!(cfg.callback_passthrough_params(), ["second"]);
+    }
+
+    /// Every denied name must be rejected, in either case. Forwarding any of
+    /// these would put a credential — or a value an app might trust — into the
+    /// browser's address bar.
+    #[test]
+    fn callback_passthrough_params_rejects_every_denied_name() {
+        for denied in DENIED_PASSTHROUGH_PARAMS {
+            for name in [denied.to_string(), denied.to_ascii_uppercase()] {
+                let err = test_config_builder()
+                    .callback_passthrough_params([name.clone()])
+                    .build()
+                    .err()
+                    .unwrap_or_else(|| panic!("{name:?} must be rejected"));
+                assert!(
+                    matches!(err, ConfigError::InvalidPassthroughParam(_)),
+                    "expected InvalidPassthroughParam for {name:?}, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn callback_passthrough_params_rejects_malformed_names() {
+        let too_long = "a".repeat(MAX_PARAM_NAME_LEN + 1);
+        for bad in ["kc action", "a&b", "a=b", "a/b", "a\u{e9}", &too_long] {
+            let err = test_config_builder()
+                .callback_passthrough_params([bad])
+                .build()
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} must be rejected"));
+            assert!(
+                matches!(err, ConfigError::InvalidPassthroughParam(_)),
+                "expected InvalidPassthroughParam for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_passthrough_params_rejects_duplicates() {
+        let err = test_config_builder()
+            .callback_passthrough_params(["kc_action", "kc_action"])
+            .build()
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, ConfigError::InvalidPassthroughParam(_)),
+            "expected InvalidPassthroughParam, got: {err}"
+        );
+    }
+
+    #[test]
+    fn callback_passthrough_params_rejects_more_than_the_cap() {
+        let names: Vec<String> = (0..=MAX_PASSTHROUGH_PARAMS)
+            .map(|i| format!("param{i}"))
+            .collect();
+        let err = test_config_builder()
+            .callback_passthrough_params(names)
+            .build()
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, ConfigError::InvalidPassthroughParam(_)),
+            "expected InvalidPassthroughParam, got: {err}"
+        );
+
+        // Exactly at the cap is fine.
+        let names: Vec<String> = (0..MAX_PASSTHROUGH_PARAMS)
+            .map(|i| format!("param{i}"))
+            .collect();
+        let cfg = test_config_builder()
+            .callback_passthrough_params(names)
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.callback_passthrough_params().len(),
+            MAX_PASSTHROUGH_PARAMS
+        );
+    }
+
+    /// Dropped empties must not consume the budget: the cap is applied after
+    /// normalization, not before.
+    #[test]
+    fn callback_passthrough_params_cap_counts_surviving_names_only() {
+        let mut names: Vec<String> = (0..MAX_PASSTHROUGH_PARAMS)
+            .map(|i| format!("param{i}"))
+            .collect();
+        names.push("   ".to_string());
+        let cfg = test_config_builder()
+            .callback_passthrough_params(names)
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.callback_passthrough_params().len(),
+            MAX_PASSTHROUGH_PARAMS
         );
     }
 

@@ -44,6 +44,7 @@ fn full_config() -> OidcBffConfig {
         .post_auth_ttl(Duration::from_secs(8 * 3600))
         .max_session_lifetime(Duration::from_secs(7 * 24 * 3600))
         .session_expiry(SessionExpiry::Sliding)
+        .callback_passthrough_params(["idp_action_status"])
         .build()
         .expect("builder should accept a fully-specified valid config")
 }
@@ -62,6 +63,7 @@ fn public_getters_are_reachable() {
     let _: Option<&str> = cfg.post_logout_redirect_url();
     let _: &[String] = cfg.scopes();
     let _: &[String] = cfg.persist_claims();
+    let _: &[String] = cfg.callback_passthrough_params();
     let _: bool = cfg.cookie_secure();
     let _: SessionExpiry = cfg.session_expiry();
     let _: Duration = cfg.pre_auth_ttl();
@@ -179,6 +181,54 @@ fn reserved_claim_names_are_rejected() {
     assert!(
         matches!(err, ConfigError::ReservedClaimName(_)),
         "expected ReservedClaimName, got: {err}"
+    );
+}
+
+/// A passthrough name that would put a credential into a browser-visible URL
+/// must be rejected — `code` is the worst case: appending the authorization
+/// code to the post-login redirect leaks it into history, `Referer`, and every
+/// access log in front of the app.
+#[test]
+fn denied_callback_passthrough_params_are_rejected() {
+    let err = expect_build_err(
+        OidcBffConfig::builder()
+            .issuer_url("https://idp.example.com")
+            .client_id("my-client")
+            .client_secret("s3cret")
+            .redirect_url("https://app.example.com/auth/callback")
+            .generate_ephemeral_session_key()
+            .callback_passthrough_params(["code"])
+            .build(),
+        "the authorization code must not be forwardable into the redirect URL",
+    );
+
+    assert!(
+        matches!(err, ConfigError::InvalidPassthroughParam(_)),
+        "expected InvalidPassthroughParam, got: {err}"
+    );
+}
+
+/// Registering a login variant is reachable from outside the crate: the params
+/// type, its error, and the route factory are all public, and the resulting
+/// `Route` mounts on an ordinary resource.
+#[test]
+fn login_variant_registration_is_reachable() {
+    use actix_web::web;
+    use bff::{AuthParamError, ExtraAuthParams};
+
+    let params = ExtraAuthParams::new([("prompt", "create")])
+        .expect("a non-reserved parameter must be accepted");
+    assert_eq!(params.len(), 1);
+
+    actix_web::App::new().service(web::resource("/auth/register").route(bff::login_route(params)));
+
+    // A parameter the crate sets itself must be refused — otherwise a variant
+    // could smuggle a second `redirect_uri` into the authorization request.
+    let err: AuthParamError = ExtraAuthParams::new([("redirect_uri", "https://evil.example.com")])
+        .expect_err("a crate-set parameter must be rejected");
+    assert!(
+        matches!(err, AuthParamError::ReservedName(_)),
+        "expected ReservedName, got: {err}"
     );
 }
 

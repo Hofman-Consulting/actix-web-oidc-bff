@@ -35,6 +35,13 @@ identity and tokens live in a server-managed session.
 - **Bring-your-own session store**: implement `SessionRepository` over
   Postgres/Redis/… to make sessions revocable server-side; the crate has no
   database dependency.
+- **Login variants**: register extra login routes that add a fixed set of
+  authorization-request parameters (`prompt=create`, a provider-specific
+  action, …), allowlist callback parameters to forward onto the post-login
+  redirect, and require a **verified** fresh authentication with
+  `require_auth_within` — the crate checks the returned `auth_time` claim and
+  rejects the login if the provider did not honour it (see [Login
+  variants](#login-variants)).
 
 ## Routes
 
@@ -44,6 +51,11 @@ identity and tokens live in a server-managed session.
 | `/auth/logout` | POST | Same-origin check, purge session, return IdP logout URL (200) or 204. |
 | `/auth/callback` | GET | Code exchange, ID-token validation, session establishment. |
 | `/auth/me` | GET | Identity claims (`sub`, `iss`, `email`, `name`) — never tokens. |
+
+`configure` registers exactly these four. Additional **login-variant** routes —
+the same flow with a fixed set of extra authorization-request parameters — are
+registered separately, at a path you choose, via `login_route`; see
+[Login variants](#login-variants).
 
 ## Quickstart
 
@@ -130,6 +142,380 @@ async fn protected(auth: bff::Auth) -> String {
 > **Bring-your-own session store** feature), which keeps tokens server-side and
 > makes sessions revocable.
 
+## Login variants
+
+`GET /auth/login` sends exactly the parameters the authorization-code + PKCE
+flow needs, and nothing else. Some provider capabilities are reachable only by
+adding one more parameter to the authorization request — the standard `prompt`,
+or a provider-specific name.
+
+The crate does **not** make `/auth/login` configurable per request: a login
+endpoint that copies query parameters into the authorization request is an
+authorization-request injection point. Instead you register *additional* login
+routes, each pinned at startup to a fixed set of extra parameters.
+`/auth/login` itself is byte-for-byte unchanged when no variant is registered.
+
+The motivating case is an **Application-Initiated Action**: a flow that the
+application asks the provider to run by name — change password, enrol a
+passkey, verify an email address — which happens entirely inside the provider's
+own UI, and whose outcome comes back as an extra query parameter on the
+callback. Keycloak is one provider that works this way (`kc_action` out,
+`kc_action_status` back); the shape is not specific to it, and the crate never
+interprets either name.
+
+Both halves of that round trip are shown below. A runnable version lives in
+[`examples/login_variants.rs`][login-variants-example].
+
+[login-variants-example]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/blob/master/examples/login_variants.rs
+
+### Registering a variant route
+
+```rust,ignore
+use actix_web::{web, App, HttpServer};
+use actix_web_oidc_bff as bff;
+
+// Build the parameter sets ONCE, here — not inside the `HttpServer::new`
+// closure, which runs per worker thread. `new` validates, so a denied or
+// malformed name fails at startup instead of once per worker.
+let register = bff::ExtraAuthParams::new([("prompt", "create")])
+    .expect("register variant parameters");
+let change_password = bff::ExtraAuthParams::new([("kc_action", "UPDATE_PASSWORD")])
+    .expect("change-password variant parameters");
+
+HttpServer::new(move || {
+    App::new()
+        .wrap(bff::session_middleware(store.clone(), &cfg))
+        .configure(|sc| bff::configure_app_data(sc, rp.clone(), cfg.clone()))
+        .configure(bff::configure)  // the stock four routes, unchanged
+        // Public: anyone may start a sign-up.
+        .service(web::resource("/auth/register").route(bff::login_route(register.clone())))
+        // Privileged: an action on an existing user's credentials, so gate it
+        // behind the `Auth` extractor (see below).
+        .service(
+            web::resource("/auth/account/password")
+                .route(bff::login_route(change_password.clone())),
+        )
+});
+```
+
+A variant route accepts `?return_to=` and applies the same `return_to`
+validation, pre-auth slot handling, PKCE, and callback processing as
+`/auth/login`. The only difference is the extra parameters on the
+authorization URL, added through `openidconnect`'s typed `add_extra_param`, so
+URL encoding is handled for you.
+
+`ExtraAuthParams::new` validates at construction — so a mistake fails at
+startup, not on a user's first login — and returns `AuthParamError` for:
+
+- more than `MAX_EXTRA_AUTH_PARAMS` (8) parameters, a value longer than
+  `MAX_EXTRA_AUTH_VALUE_LEN` (512) bytes or containing a control character, a
+  duplicate name, or a name that is empty, over 64 bytes, or outside
+  `[A-Za-z0-9_.-]`. Rejections name the *parameter*, never the value;
+- any name the crate sets itself — `client_id`, `redirect_uri`,
+  `response_type`, `scope`, `state`, `nonce`, `code_challenge`,
+  `code_challenge_method`. Providers disagree on whether the first or the last
+  occurrence of a repeated parameter wins, so a duplicate is at best a broken
+  flow and at worst a stolen authorization code;
+- `response_mode`, which would move the response off the query string and break
+  the `GET /auth/callback` handler;
+- `request` / `request_uri` (JAR), which replace the entire request with a
+  caller-supplied blob and thereby bypass every entry above;
+- credentials that must never travel in a front-channel URL —
+  `client_secret`, `client_assertion`, `client_assertion_type`,
+  `code_verifier`;
+- `max_age`, denied for a reason unlike any of the above: it is not dangerous,
+  it is **unverifiable in the hand-rolled form**. Send it through
+  [`require_auth_within`](#requiring-a-verified-fresh-authentication) instead,
+  which sends it *and* checks the result.
+
+### Gating a privileged variant
+
+"Change the credentials of the current user" is only meaningful for a user who
+is already signed in, so put such a variant behind the `Auth` extractor.
+`login_route` returns an `actix_web::Route` — an already-built handler — so the
+gate goes one level up, on the enclosing scope:
+
+```rust,ignore
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServiceRequest, ServiceResponse};
+use actix_web::middleware::{from_fn, Next};
+use actix_web::{web, Error};
+
+async fn require_auth(
+    mut req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<impl MessageBody>, Error> {
+    // 401 from the extractor when the session has no `sub`.
+    let _auth = req.extract::<bff::Auth>().await?;
+    next.call(req).await
+}
+
+App::new().service(
+    web::scope("/auth/account")
+        .wrap(from_fn(require_auth))
+        .service(web::resource("/password").route(bff::login_route(change_password.clone()))),
+);
+```
+
+### Getting the outcome back
+
+The callback normally discards every query parameter but `code` and `state`.
+`callback_passthrough_params` allowlists names to append — percent-encoded — to
+the post-login redirect URL:
+
+```rust,ignore
+let cfg = bff::OidcBffConfig::builder()
+    // …
+    .return_to_prefix("/app")
+    .callback_passthrough_params(["kc_action_status"])
+    .build()?;
+```
+
+The round trip is then: `GET /auth/account/password?return_to=/app/account` →
+provider runs the action → `GET /auth/callback?code=…&state=…&kc_action_status=success`
+→ `302 Location: /app/account?kc_action_status=success`. The landing page reads
+it like any other query parameter:
+
+```rust,ignore
+use std::collections::HashMap;
+use actix_web::{web, HttpResponse};
+
+async fn account(auth: bff::Auth, q: web::Query<HashMap<String, String>>) -> HttpResponse {
+    let status = q.get("kc_action_status");   // untrusted — display only, escaped
+    // …
+}
+```
+
+An empty allowlist (the default) is exactly the pre-0.3 behaviour: the callback
+redirects to the stored `return_to` untouched.
+
+Rules applied per parameter, on the way out:
+
+- **Success path only.** An IdP `error=` response returns `400` and never
+  redirects, so nothing is appended there.
+- Values longer than `MAX_PASSTHROUGH_VALUE_LEN` (256) bytes, containing control
+  characters, or containing the Unicode replacement character `U+FFFD`, are
+  **dropped with a warning that names the parameter and never the value**. The
+  last rule catches bytes that are not valid UTF-8: percent-decoding is lossy,
+  so `%FF` arrives as `U+FFFD` rather than as an error.
+- Only the **first** occurrence of a repeated name is considered, and the drop
+  decision is final: a second, well-formed copy cannot revive a parameter whose
+  first copy was rejected.
+- A name already present in the `return_to` query string is skipped — the
+  application's own parameter wins.
+- The appended parameters are bounded in aggregate by
+  `MAX_PASSTHROUGH_TOTAL_LEN` (1024) bytes, measured on the *encoded* form. A
+  pair that would not fit is skipped and the next one is still tried, so one
+  long value cannot starve the shorter parameters behind it.
+- At most `MAX_PASSTHROUGH_PARAMS` (8) names, charset `[A-Za-z0-9_.-]`, no
+  duplicates. Violations fail `build()` with
+  `ConfigError::InvalidPassthroughParam`.
+- A config-time deny-list refuses `code`, `state`, `error` /
+  `error_description` / `error_uri`, `iss`, `session_state`, any token name,
+  and client credentials.
+
+### Requiring a verified fresh authentication
+
+A privileged variant usually wants more than "the user has a session" — it wants
+"the user authenticated recently". `require_auth_within` is that, and unlike a
+hand-written `max_age` parameter it comes with a check on the way back:
+
+```rust,ignore
+use std::time::Duration;
+
+let change_password =
+    bff::ExtraAuthParams::new([("kc_action", "UPDATE_PASSWORD"), ("prompt", "login")])
+        .expect("change-password variant parameters")
+        // Re-authentication no older than five minutes — sent to the provider,
+        // and verified against the ID token when the callback returns.
+        .require_auth_within(Duration::from_secs(300))
+        .expect("re-authentication age");
+```
+
+It does three things as one unit:
+
+1. sends `max_age=300` on the authorization request, through `openidconnect`'s
+   typed `set_max_age`;
+2. records the requirement — a single integer, nothing else — in the pre-auth
+   slot, because `/auth/callback` is shared by every login route and would
+   otherwise have no idea this flow asked for anything;
+3. checks the validated ID token's `auth_time` claim in the callback and
+   **rejects the login with `400` and no session established** when the claim is
+   absent or too old.
+
+The full round trip: `GET /auth/account/password?return_to=/app/account` →
+authorization request carries `max_age=300` → the provider re-authenticates the
+user *if its own record of them is older than that* (its UI, its policy) →
+`GET /auth/callback?code=…&state=…` → the crate verifies `auth_time` →
+`302 Location: /app/account`, or `400` and no session.
+
+**The provider is the enforcement point; this crate verifies that enforcement
+happened.** That distinction is the whole feature. The re-prompt happens at the
+identity provider — no RP can make a user type a password. What an RP *can* do
+is refuse to accept the result when the evidence is missing or stale, which is
+exactly the case a bare `max_age` parameter cannot distinguish.
+`auth_max_age()` reads the requirement back.
+
+- **`max_age` is not `prompt=login`.** With `max_age=300`, a user who
+  authenticated two minutes ago is *not* re-prompted — the provider simply
+  returns the existing `auth_time` and the crate accepts it, which is correct
+  per OIDC. If you want the user to actually be challenged every time, pair it
+  with `("prompt", "login")` as the example above does. `require_auth_within`
+  bounds *how old* the authentication may be; `prompt=login` asks for a fresh
+  one outright, and only the first of those is verifiable.
+- **`auth_time` means what your provider says it means.** Several major
+  providers report when the user's SSO *session* began, not when they last
+  proved a credential. The crate verifies the provider's claim about freshness;
+  the definition of freshness stays the provider's.
+- **It fails closed on a missing `auth_time`.** OIDC Core makes the claim
+  REQUIRED in the ID token when the request carried `max_age`, so an absent
+  claim means the provider did not honour the request — the silent-downgrade
+  case this exists to catch. A token with no evidence is not a token that passed.
+- **A step-up must complete as the same user.** When a requirement is set and
+  the session already holds a subject, a callback that comes back as a
+  *different* subject is rejected rather than silently switching accounts — the
+  provider's re-prompt commonly offers a "use another account" option, and a
+  route that reads as "confirm it's you" must not quietly become someone else's
+  session. Plain login routes are unaffected: switching accounts by logging in
+  again is ordinary, and that is where it belongs.
+- **The age is measured from the authorization request, not from the callback.**
+  That is what the provider evaluated, so whatever the user then does at the
+  provider — the consent screen, or the very action the variant asked for —
+  is not charged against the budget. A five-minute requirement does not reject a
+  user who spends six minutes filling in a password form. Total flow duration is
+  bounded separately, by `pre_auth_ttl`.
+- **Clock skew**: `AUTH_TIME_SKEW_SECS` (60 s) of slack applies in **both**
+  directions — it absorbs drift between your clock and the provider's, not
+  elapsed time — so the effective window is `max_age + 60s`, and an `auth_time`
+  slightly in the future is tolerated rather than treated as malformed.
+  `Duration::ZERO` is legal and meaningful: the provider enforces it strictly.
+- **`max_age` is deny-listed as a raw parameter.** `ExtraAuthParams::new([("max_age", "300")])`
+  fails with `AuthParamError::ReservedName`, so the unverified form is not
+  reachable and exactly one `max_age` can ever appear on the URL.
+- `require_auth_within` returns `AuthParamError::InvalidMaxAge` for a
+  `Duration` that is not a whole number of seconds (rejected rather than
+  truncated, matching the crate's TTL handling) or that exceeds
+  `MAX_AUTH_AGE_SECS` (365 days).
+
+#### It gates the login, not the session
+
+`require_auth_within` is a **precondition on completing that login**, not a
+lasting property of the session it creates. The session it produces is an
+ordinary one; nothing marks it as "stepped up". So *arriving* at your
+`return_to` is not proof that a step-up happened — the user could equally have
+navigated there directly with the session they already had.
+
+If a handler needs to make a decision based on freshness, persist the claim and
+check it there:
+
+```rust,ignore
+// At startup:
+let cfg = bff::OidcBffConfig::builder()
+    // …
+    .persist_claims(["auth_time"])
+    .build()?;
+
+// In the handler that actually needs a recent authentication:
+async fn change_email(auth: bff::Auth) -> Result<HttpResponse, actix_web::Error> {
+    let recent = auth
+        .get_claim("auth_time")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|t| chrono::Utc::now().timestamp() - t < 300);
+
+    if !recent {
+        // Send them through the step-up variant, then back here.
+        return Ok(HttpResponse::Found()
+            .append_header(("Location", "/auth/step-up?return_to=/app/account/email"))
+            .finish());
+    }
+    // …
+}
+```
+
+`auth_time` is explicitly allowed in `persist_claims` for this reason. The two
+mechanisms compose: the variant guarantees the login could not complete without
+a fresh authentication, and the persisted claim lets the handler confirm it
+independently.
+
+### Security notes for login variants
+
+- **Parameter values are configuration, not input.** Every value handed to
+  `ExtraAuthParams::new` must be a constant supplied by the application at
+  startup, **never derived from the incoming request** — not from a query
+  parameter, not from a header, not from a session value the user can steer.
+  That single rule is what keeps the login endpoints free of
+  authorization-request injection. It is **enforced by convention, not by the
+  type system**: `ExtraAuthParams::new` takes strings and cannot tell where
+  they came from. Reviewing a variant route means tracing every value back to
+  its source.
+- **A name the provider bakes into its own authorization endpoint can collide.**
+  The deny-list covers every parameter *this crate* adds, but some providers
+  publish an `authorization_endpoint` that already carries a query string (a
+  policy or tenant selector, say). An `ExtraAuthParams` name matching one of
+  those becomes a second occurrence of it, and most providers take the last.
+  Discovery-dependent and consumer-configured rather than attacker-controlled —
+  but if your provider's authorization endpoint has its own query parameters,
+  do not reuse their names.
+- **Freshness is verified; assurance level is not.** The two halves of "step-up"
+  are not equally checkable, and the API deliberately treats them differently:
+  - **`max_age`, via `require_auth_within`, is verified.** The requirement rides
+    along in the pre-auth slot and the callback checks the returned ID token's
+    `auth_time` claim, rejecting the login outright when it is missing or stale.
+    A provider that ignored the request is no longer indistinguishable from one
+    that honoured it. The provider is still where the re-prompt happens — see
+    [Requiring a verified fresh
+    authentication](#requiring-a-verified-fresh-authentication) — but the RP no
+    longer has to take its word for it. The raw `("max_age", "300")` parameter
+    is deny-listed so the unverified form is not reachable.
+  - **`acr_values` and a bare `prompt=login` are still transmitted, not
+    verified.** They have no machine-checkable postcondition the way `max_age`
+    has `auth_time`: `prompt=login` produces no claim at all saying "the user
+    was prompted", and `acr` is an opaque provider-defined string whose meaning
+    only your application knows. There is nothing for the crate to compare
+    against, so it does not pretend to. A route built on them alone carries **no
+    RP-side guarantee**. If you need one, persist the claim and check it
+    yourself — the crate stays out of interpreting it:
+
+    ```rust,ignore
+    let cfg = bff::OidcBffConfig::builder()
+        // …
+        .persist_claims(["acr"])
+        .build()?;
+
+    async fn sensitive(auth: bff::Auth) -> Result<HttpResponse, actix_web::Error> {
+        // Your own assurance-level check on auth.get_claim("acr") — which
+        // values count as sufficient is application policy.
+        // …
+    }
+    ```
+
+    Pairing an `acr_values` variant with `require_auth_within` at least pins
+    down *when* the authentication happened, even though *how* remains
+    unverified.
+
+- **Passthrough values are attacker-shaped.** From the application's point of
+  view they arrive over a redirect the user's browser performed, from a party
+  this crate does not validate the content of. Treat them exactly like any other
+  untrusted query parameter: never render one into HTML unescaped, never use one
+  as a redirect target, never let one be an authorization input. They are
+  display data.
+- **Namespace the allowlisted names.** A forwarded parameter lands in *your*
+  application's query string, next to your own parameters. A provider-prefixed
+  name (`kc_action_status`) already cannot collide; when you get to pick the
+  name, give it an `idp_` prefix so it never shadows something your own handler
+  reads.
+- **Why the URL and not a one-shot session flag.** The URL is the only channel
+  that survives the provider's redirect without extra state on either side: the
+  provider puts the value on the callback, the callback puts it on the
+  `Location` header, and the landing page reads it directly — no extra session
+  write, no key to expire, no coordination between the callback and the page.
+  The honest trade-off is that a query parameter is *visible*: it lands in
+  browser history, in the `Referer` header of the next outbound request, and in
+  the access logs of every proxy in front of the app. That visibility is exactly
+  why the deny-list exists and why it is not negotiable — an authorization code,
+  a token, or `state` in any of those places is a disclosure. A short,
+  non-sensitive status string is not.
+
 ## Configuration
 
 `OidcBffConfig::builder()` is the only way to construct a config. Setters are
@@ -146,6 +532,7 @@ infallible; all validation happens in `build()`, which returns `ConfigError`.
 | `scopes(..)` | no | `openid`, `profile`, `email` | Any `IntoIterator` of strings; `openid` is always included. |
 | `return_to_prefix(..)` | no | `/` | Safe path prefix for post-login redirects; must start with `/`. |
 | `persist_claims(..)` | no | empty | Extra ID-token claims to copy into the session (e.g. `["groups", "amr"]`). Reserved internal names and OIDC validation artifacts are rejected. |
+| `callback_passthrough_params(..)` | no | empty | Query-parameter names to forward from the IdP's callback request onto the post-login redirect URL. Empty is the pre-0.3 behaviour. Success path only; values are untrusted. See [Login variants](#login-variants). |
 | `post_logout_redirect_url(..)` | no | unset | Sent as `post_logout_redirect_uri` during RP-initiated logout; must be registered at the IdP. |
 | `pre_auth_ttl(..)` | no | 600 s | Pre-auth (state/PKCE) session TTL. See [TTL rules](#ttl-rules) below. |
 | `post_auth_ttl(..)` | no | 8 h | Authenticated session TTL. Additionally must be **at most `max_session_lifetime`** — a larger value fails `build()`. |
@@ -347,9 +734,14 @@ Under `SessionExpiry::Sliding`, `DbSessionStore::with_touch_coalesce_secs`
 - **The absolute lifetime bounds the BFF session, not IdP SSO.** When it
   elapses the user is sent back through `/auth/login`, which resets the clock.
   If their SSO session at the IdP is still live, that re-login can complete
-  without any visible prompt. Genuinely forcing re-authentication would
-  additionally require `max_age`/`prompt` on the authorization request, which
-  this crate does not currently send.
+  without any visible prompt. Genuinely forcing re-authentication requires
+  `max_age`/`prompt=login` on the authorization request, which a
+  [login variant](#login-variants) can send.
+  `ExtraAuthParams::require_auth_within` is the form to use: it sends `max_age`
+  **and** verifies the resulting `auth_time` claim, so a provider that quietly
+  reused its SSO session fails the login instead of producing one that only
+  looks fresh. See [Requiring a verified fresh
+  authentication](#requiring-a-verified-fresh-authentication).
 
 ## Releasing
 

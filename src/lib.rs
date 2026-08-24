@@ -17,6 +17,9 @@
 //!   `actix-session`'s built-in cookie store).
 //! - [`ensure_same_origin`] / [`validate_return_to`] — CSRF and open-redirect
 //!   defenses.
+//! - [`login_route`] / [`ExtraAuthParams`] — register additional login routes
+//!   that add fixed extra parameters (e.g. `prompt=create`) to the OIDC
+//!   authorization request.
 
 /// Runtime configuration: [`OidcBffConfig`] and [`ConfigError`].
 pub mod config;
@@ -32,6 +35,7 @@ pub mod handlers;
 pub mod middleware;
 /// OIDC discovery and client caching: [`OidcRp`] and [`DiscoveryError`].
 pub mod oidc;
+pub(crate) mod param_names;
 /// Route registration: [`configure`] and [`configure_app_data`].
 pub mod routes;
 pub(crate) mod session_state;
@@ -45,8 +49,9 @@ pub use config::{
 pub use csrf::ensure_same_origin;
 pub use error::BffError;
 pub use extractor::Auth;
-pub use handlers::login::validate_return_to;
+pub use handlers::login::{login_route, validate_return_to, AuthParamError, ExtraAuthParams};
 pub use middleware::session_middleware;
 pub use oidc::{DiscoveryError, OidcRp};
+pub use param_names::MAX_PARAM_NAME_LEN;
 pub use routes::{configure, configure_app_data};
 pub use store::{DbSessionStore, RepoError, SessionRecord, SessionRepository};

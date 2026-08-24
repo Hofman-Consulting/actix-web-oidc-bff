@@ -120,6 +120,32 @@ pub(crate) struct PreAuthEntry {
     pub return_to: String,
     /// Unix timestamp when the login was initiated (UTC seconds).
     pub started_at: i64,
+    /// Re-authentication requirement carried over from the login route, in
+    /// seconds, when the variant was built with
+    /// `ExtraAuthParams::require_auth_within`. `None` for `/auth/login` and
+    /// for any variant that did not ask for one.
+    ///
+    /// This is the **one** thing a login variant is allowed to put into a
+    /// pre-auth slot, and the exception is deliberate. Extra authorization
+    /// parameters must never be stored here (up to 8 × 512 bytes × 5 slots
+    /// would blow the ~4 KB `CookieSessionStore` budget several times over);
+    /// this is a single integer, and the callback genuinely cannot enforce the
+    /// requirement without it — the requirement belongs to the route that
+    /// started the flow, and `/auth/callback` is shared by all of them.
+    ///
+    /// `skip_serializing_if` keeps the cost at literally zero bytes for every
+    /// login that did not ask for a requirement — which is all of them for a
+    /// consumer that registers no step-up variant. Without it the field costs
+    /// `"max_age_secs":null` (~20 bytes) in each of up to
+    /// [`PRE_AUTH_MAX_SLOTS`] slots, and that budget is already tight against
+    /// the ~4 KB `CookieSessionStore` limit.
+    ///
+    /// `default` is what makes a slot written by an older version deserialize
+    /// after a deploy (serde already defaults a missing `Option` to `None`, so
+    /// this is belt-and-braces rather than load-bearing — but it becomes
+    /// load-bearing the moment the field stops being an `Option`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_secs: Option<i64>,
 }
 
 // ── Constant-time comparison ──────────────────────────────────────────────────
@@ -221,12 +247,86 @@ mod tests {
 
     fn entry(state: &str, started_at: i64) -> PreAuthEntry {
         PreAuthEntry {
+            max_age_secs: None,
             state: state.to_string(),
             pkce_verifier: "verifier".to_string(),
             nonce: "nonce".to_string(),
             return_to: "/".to_string(),
             started_at,
         }
+    }
+
+    /// A pre-auth slot written by a version without `max_age_secs` must still
+    /// deserialize after a deploy, carrying no re-authentication requirement —
+    /// otherwise every login in flight across the rollout would fail with
+    /// "unknown or expired login attempt", the whole vec having failed to
+    /// deserialize.
+    #[test]
+    fn pre_auth_entry_deserializes_without_max_age_secs() {
+        let old_shape = serde_json::json!({
+            "state": "s",
+            "pkce_verifier": "v",
+            "nonce": "n",
+            "return_to": "/app",
+            "started_at": 1_700_000_000_i64
+        });
+
+        let parsed: PreAuthEntry =
+            serde_json::from_value(old_shape).expect("a pre-0.3 slot must still deserialize");
+        assert_eq!(parsed.max_age_secs, None);
+        assert_eq!(parsed.state, "s");
+        assert_eq!(parsed.return_to, "/app");
+    }
+
+    /// A vec of old-shape slots must round-trip too — that is the shape the
+    /// session actually holds.
+    #[test]
+    fn pre_auth_vec_of_old_entries_deserializes() {
+        let old_vec = serde_json::json!([
+            {
+                "state": "a",
+                "pkce_verifier": "v",
+                "nonce": "n",
+                "return_to": "/",
+                "started_at": 1_700_000_000_i64
+            },
+            {
+                "state": "b",
+                "pkce_verifier": "v",
+                "nonce": "n",
+                "return_to": "/",
+                "started_at": 1_700_000_001_i64
+            }
+        ]);
+
+        let parsed: Vec<PreAuthEntry> =
+            serde_json::from_value(old_vec).expect("a pre-0.3 slot vec must still deserialize");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|e| e.max_age_secs.is_none()));
+    }
+
+    /// A slot with no requirement must serialize to no `max_age_secs` key at
+    /// all, not to `"max_age_secs":null`. Five slots × ~20 bytes of nulls is
+    /// real spend against the ~4 KB `CookieSessionStore` budget, paid by every
+    /// consumer including those with no step-up variant at all.
+    #[test]
+    fn pre_auth_entry_omits_an_unset_max_age_from_the_wire_format() {
+        let json = serde_json::to_value(entry("s", 1_700_000_000)).unwrap();
+        assert!(
+            json.get("max_age_secs").is_none(),
+            "an unset requirement must not be serialized, got: {json}"
+        );
+
+        let with_requirement = PreAuthEntry {
+            max_age_secs: Some(300),
+            ..entry("s", 1_700_000_000)
+        };
+        let json = serde_json::to_value(&with_requirement).unwrap();
+        assert_eq!(json["max_age_secs"], serde_json::json!(300));
+
+        // And it round-trips.
+        let back: PreAuthEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.max_age_secs, Some(300));
     }
 
     // ── S1.1: RESERVED_SESSION_KEYS covers every constant ─────────────────────
