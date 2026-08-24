@@ -18,7 +18,7 @@ actix-session = { version = "0.10", features = ["cookie-session"] }
 # native-tls; we want rustls. The crate's HTTP calls (discovery, token
 # exchange) all go through openidconnect's client.
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
-secrecy = { version = "0.8", features = ["serde"] }
+secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
