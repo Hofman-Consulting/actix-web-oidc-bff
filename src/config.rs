@@ -520,7 +520,7 @@ impl OidcBffConfigBuilder {
     /// backtrace could contain it. Required.
     #[must_use]
     pub fn client_secret(mut self, client_secret: impl Into<String>) -> Self {
-        self.client_secret = Some(SecretString::new(client_secret.into()));
+        self.client_secret = Some(SecretString::from(client_secret.into()));
         self
     }
 
