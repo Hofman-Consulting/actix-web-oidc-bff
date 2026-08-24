@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-24
+
+> **Breaking (source-level) only for callers that invoke the callback handler
+> directly**; see Changed. Applications registering the routes with
+> `configure()` upgrade without a code change.
+
 ### Added
 
 - **Extra authorization-request parameters.** `ExtraAuthParams` +
@@ -299,6 +305,7 @@ reach the browser.
 - Configuration from `OIDC_*` environment variables via
   `OidcBffConfig::from_env`.
 
-[Unreleased]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Hofman-Consulting/actix-web-oidc-bff/releases/tag/v0.1.0
