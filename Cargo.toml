@@ -1,6 +1,6 @@
 [package]
 name = "actix-web-oidc-bff"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Backend-for-Frontend OIDC relying party for actix-web: server-side sessions, PKCE, and provider-agnostic login/callback/logout/me routes."
