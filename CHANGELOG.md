@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Breaking for every consumer that declares `actix-session` itself**; see
+> Changed. No API of this crate changed shape — the break is the dependency
+> version, and the fix is a one-line `Cargo.toml` edit (or dropping the entry
+> in favour of the new re-export).
+
+### Added
+
+- **`actix-session` is re-exported as `actix_web_oidc_bff::actix_session`.**
+  Its `SessionStore`, `SessionMiddleware` and `TtlExtensionPolicy` appear in
+  this crate's own signatures (`session_middleware`, `DbSessionStore`,
+  `SessionExpiry`), which makes it a *public dependency*: a consumer declaring
+  a semver-incompatible version of it ends up with two copies of those types in
+  the graph, and passing a store built from one into an API expecting the other
+  fails to compile with the opaque `expected SessionStore, found SessionStore`.
+  Reaching for the re-export instead of a direct dependency makes that
+  impossible. Declaring `actix-session` directly is still supported; pin it to
+  `0.11` to match. The same caveat applies to `actix-web`, which is public for
+  the same reason (`configure`, `login_route`, `session_key`) — pin it to `4`.
+
+### Changed
+
+- **`actix-session` 0.10 → 0.11** (breaking, see above). The upgrade itself is
+  additive upstream: the `SessionStore` trait is byte-for-byte unchanged, and
+  0.11 only adds `Session::contains_key` and `Session::update[_or]()`. No code
+  in this crate changed to accommodate it, and no behaviour changed. Consumers
+  who take the re-export will not have to touch anything on future bumps of
+  this kind.
+- **`rand` 0.8 → 0.10** (internal only; `rand` does not appear in the public
+  API). 0.10 renames `distributions` to `distr` and `thread_rng()` to `rng()`,
+  and moves `sample_iter` from `Rng` onto the new `RngExt` trait. Session-key
+  generation is otherwise untouched — `rand::rng()` is the same ChaCha12
+  CSPRNG that `thread_rng()` was.
+
+### Fixed
+
+- **Yanked `chacha20` 0.10.0 pinned in `Cargo.lock`.** Both 0.10.0 and 0.10.1
+  were yanked upstream; the lockfile now pins 0.10.2, which restores a
+  reproducible build and a green `cargo deny check`. This is a lockfile-only
+  change with no effect on consumers, who resolve their own graph and — since
+  the bad versions are yanked — already pick up 0.10.2 on their own.
+
 ## [0.3.0] - 2026-08-24
 
 > **Breaking (source-level) only for callers that invoke the callback handler

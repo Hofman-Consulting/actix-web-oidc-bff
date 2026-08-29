@@ -59,9 +59,11 @@
 
 use std::sync::Arc;
 
-use actix_session::storage::CookieSessionStore;
 use actix_web::{App, HttpServer};
 use actix_web_oidc_bff as bff;
+// Via the crate's re-export rather than a direct `actix-session` dependency —
+// see "Quickstart" in README.md.
+use bff::actix_session::storage::CookieSessionStore;
 
 /// A downstream handler protected by the [`bff::Auth`] extractor.
 ///

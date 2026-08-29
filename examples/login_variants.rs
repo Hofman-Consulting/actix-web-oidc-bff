@@ -80,12 +80,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use actix_session::storage::CookieSessionStore;
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::middleware::{from_fn, Next};
 use actix_web::{web, App, Error, HttpResponse, HttpServer};
 use actix_web_oidc_bff as bff;
+// Via the crate's re-export rather than a direct `actix-session` dependency —
+// see "Quickstart" in README.md.
+use bff::actix_session::storage::CookieSessionStore;
 
 /// Query-parameter name the provider reports an action's outcome under, and
 /// the one name this app allowlists for passthrough.
