@@ -126,4 +126,20 @@ mod tests {
             .unwrap();
         let _ = session_middleware(CookieSessionStore::default(), &cfg);
     }
+
+    /// A store reached through the crate's `actix_session` re-export must
+    /// satisfy `session_middleware`'s `SessionStore` bound.
+    ///
+    /// This is the property the re-export exists to guarantee: consumers who
+    /// go through `actix_web_oidc_bff::actix_session` cannot end up with a
+    /// second, incompatible copy of `actix-session` in their graph. The
+    /// assertion is entirely compile-time — if the re-exported path ever
+    /// stopped resolving to the same crate the signatures are built from,
+    /// this stops compiling rather than failing at runtime.
+    #[test]
+    fn store_from_the_crate_reexport_satisfies_the_bound() {
+        let cfg = config::test_config_builder().build().unwrap();
+        let store = crate::actix_session::storage::CookieSessionStore::default();
+        let _ = session_middleware(store, &cfg);
+    }
 }

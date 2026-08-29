@@ -43,6 +43,19 @@ pub(crate) mod session_state;
 /// [`DbSessionStore`].
 pub mod store;
 
+/// The `actix-session` this crate is built against, re-exported so consumers
+/// do not have to declare it themselves.
+///
+/// `SessionStore`, `SessionMiddleware` and `TtlExtensionPolicy` appear in this
+/// crate's public API ([`session_middleware`], [`DbSessionStore`]), which makes
+/// `actix-session` a *public dependency*: a consumer who declares their own
+/// semver-incompatible version gets two copies of those types in the graph,
+/// and passing a store built from one into an API expecting the other fails to
+/// compile with the notoriously opaque `expected SessionStore, found
+/// SessionStore`. Going through this re-export makes that impossible, and means
+/// a future `actix-session` bump here only breaks consumers who actually touch
+/// something that changed upstream — rather than all of them, unconditionally.
+pub use actix_session;
 pub use config::{
     ConfigError, OidcBffConfig, OidcBffConfigBuilder, SessionExpiry, SessionExpiryParseError,
 };

@@ -59,12 +59,36 @@ registered separately, at a path you choose, via `login_route`; see
 
 ## Quickstart
 
+`actix-session` is a **public dependency**: its `SessionStore`,
+`SessionMiddleware` and `TtlExtensionPolicy` appear in this crate's own
+signatures. Declaring a semver-incompatible version of it yourself puts two
+copies of those types in the dependency graph, and passing a store built from
+one into an API expecting the other fails to compile with the notoriously
+opaque `expected SessionStore, found SessionStore`.
+
+The crate therefore re-exports the version it was built against. Prefer it, and
+you cannot get the mismatch:
+
+```toml
+[dependencies]
+actix-web-oidc-bff = "0.4"
+# no actix-session entry needed
+```
+
+```rust,ignore
+use actix_web_oidc_bff::actix_session::storage::CookieSessionStore;
+```
+
+Depending on `actix-session` directly is still supported — pin it to `"0.11"`
+to match. The same caveat applies to `actix-web` itself, which is public for
+the same reason (`configure`, `login_route`, `session_key`); pin it to `"4"`.
+
 ```rust,ignore
 use std::sync::Arc;
 use std::time::Duration;
 use actix_web::{App, HttpServer};
-use actix_session::storage::CookieSessionStore;
 use actix_web_oidc_bff as bff;
+use bff::actix_session::storage::CookieSessionStore;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
