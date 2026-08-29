@@ -122,7 +122,7 @@ use actix_session::storage::{LoadError, SaveError, SessionKey, SessionStore, Upd
 use actix_web::cookie::time::Duration as CookieDuration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
 use std::{collections::HashMap, future::Future, sync::Arc};
 
 use crate::config::{DEFAULT_MAX_SESSION_LIFETIME_SECS, DEFAULT_PRE_AUTH_TTL_SECS, MAX_TTL_SECS};
@@ -540,7 +540,7 @@ fn compute_effective_expiry(
 }
 
 fn generate_session_key() -> Result<SessionKey, anyhow::Error> {
-    let key: String = rand::thread_rng()
+    let key: String = rand::rng()
         .sample_iter(&Alphanumeric)
         .take(64)
         .map(char::from)
@@ -1082,7 +1082,7 @@ mod tests {
     }
 
     fn random_key_str() -> String {
-        rand::thread_rng()
+        rand::rng()
             .sample_iter(&Alphanumeric)
             .take(64)
             .map(char::from)
