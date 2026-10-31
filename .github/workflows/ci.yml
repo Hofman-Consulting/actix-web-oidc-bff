@@ -135,10 +135,12 @@ jobs:
 
   deny:
     # Replaces the old cargo-audit job. cargo-deny is a superset: it reads
-    # deny.toml (which carries the documented RUSTSEC-2023-0071 ignore that
-    # used to live in .cargo/audit.toml) and additionally enforces the licence
-    # allowlist, duplicate/wildcard bans and the crates.io-only source policy.
-    # Metadata-only, so it stays ungated on `needs:` and runs on every push/PR.
+    # deny.toml, which carries the documented advisory ignores
+    # (RUSTSEC-2023-0071 rsa, which used to live in .cargo/audit.toml;
+    # RUSTSEC-2026-0258 h2; RUSTSEC-2026-0387 crypto-bigint). It also enforces
+    # the licence allowlist, duplicate/wildcard bans and the crates.io-only
+    # source policy. Metadata-only, so it stays ungated on `needs:` and runs
+    # on every push/PR.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:

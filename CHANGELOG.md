@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Lockfile refresh clearing RustSec advisories.** `rustls` 0.23.45 → 0.23.46
+  (RUSTSEC-2026-0346, -0347, -0348, -0349), `rustls-webpki` 0.103.15 →
+  0.103.16 (-0382), `webpki-roots` 1.0.7 → 1.0.11 (-0381), `tokio` 1.53.1 →
+  1.54.1 (-0386), and `zstd` 0.13.3 → 0.14.3 / `zstd-safe` 7.2.4 → 8.2.0 /
+  `zstd-sys` 2.0.16 → 2.1.2 (-0391, -0398, -0403, -0410). The
+  semver-incompatible `zstd` jump arrives via `actix-http` 3.13.3 → 3.19.0
+  (`actix-web` 4.15.0 → 4.17.0); this crate's declared requirements are
+  unchanged. Consumers resolve their own graph and should run `cargo update`
+  themselves.
+- **RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5) is a documented ignore** in
+  `deny.toml`: it arrives via `openidconnect` → `p256`/`p384` with no reachable
+  fix, and is only reached for ES256/ES384 ID-token signature verification on
+  public inputs.
+
+### Changed
+
+- **`resolver = "3"` in `Cargo.toml`** so `cargo update` honours
+  `rust-version` (1.88); no effect on consumers. `actix-web` 4.18 /
+  `actix-http` 3.20 need rustc 1.89 and are therefore not picked up; as of
+  2026-10-31 they contain no security fixes.
+
 ## [0.4.0] - 2026-08-29
 
 > **Breaking for every consumer that declares `actix-session` itself**; see
