@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Breaking only for consumers building on Rust 1.88**; see Changed. No API
+> of this crate changed.
+
+### Changed
+
+- **MSRV 1.88 → 1.89**, required by `actix-web` 4.18 / `actix-http` 3.20. The
+  lockfile moves `actix-web` 4.17.0 → 4.18.1, `actix-http` 3.19.0 → 3.20.0,
+  `actix-server` 2.9.8 → 2.10.0 and `actix-web-codegen` 4.4.0 → 4.5.0; the
+  declared requirement stays `actix-web = "4"`. 0.4.x remains usable on 1.88
+  but, per `SECURITY.md`, does not receive fixes.
+
 ## [0.4.1] - 2026-10-31
 
 ### Security
