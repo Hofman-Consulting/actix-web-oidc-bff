@@ -6,7 +6,7 @@ Security fixes are provided for the latest published minor release.
 
 | Version | Supported |
 |---|---|
-| 0.1.x   | ✓ |
+| 0.5.x   | ✓ |
 
 ## Reporting a vulnerability
 

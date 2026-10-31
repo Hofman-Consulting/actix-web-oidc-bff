@@ -21,14 +21,3 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    # Dependabot does not honour `rust-version`. actix-web 4.18 and actix-http
-    # 3.20 raised their MSRV to 1.89 while this crate's is 1.88, so these bumps
-    # can only fail the msrv CI job; as of 2026-10-31 they carry no security
-    # fixes. Ignoring them does not hide security problems: a RustSec advisory
-    # against either crate still surfaces via the cargo-deny advisories cron in
-    # ci.yml. Remove this ignore when the crate's MSRV is bumped to >= 1.89.
-    ignore:
-      - dependency-name: "actix-web"
-        versions: [">= 4.18"]
-      - dependency-name: "actix-http"
-        versions: [">= 3.20"]
