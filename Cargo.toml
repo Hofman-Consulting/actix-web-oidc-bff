@@ -3,6 +3,10 @@ name = "actix-web-oidc-bff"
 version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
+# MSRV-aware resolver: `cargo update` prefers versions compatible with
+# rust-version, falling back otherwise. Requires Cargo >= 1.84. No effect
+# on consumers — their workspace root decides resolution.
+resolver = "3"
 description = "Backend-for-Frontend OIDC relying party for actix-web: server-side sessions, PKCE, and provider-agnostic login/callback/logout/me routes."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
