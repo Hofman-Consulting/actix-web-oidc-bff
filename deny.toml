@@ -39,8 +39,8 @@ yanked = "deny"
 # Every entry needs a justification and a re-evaluation trigger. The sibling
 # paykit repo's copy of this file says "empty is the desired steady state" for
 # this list. This repo deliberately ships it non-empty: every entry is a
-# transitive dependency with no fixed release this crate can reach (`rsa` and
-# `crypto-bigint` via `openidconnect`, `h2` via `actix-http`). Each one is
+# transitive dependency with no fixed release this crate can reach (`rsa` via
+# `openidconnect`, `h2` via `actix-http`). Each one is
 # tolerated only on a documented argument that the vulnerable path is not
 # exercised, and each lists the change that would invalidate that argument.
 #
@@ -53,13 +53,14 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = """
 rsa 0.9 Marvin attack: a timing sidechannel on RSA private-key operations.
-No fixed release exists (the fix lands in rsa 0.10, unreleased at time of
-writing). `rsa` is pulled in transitively by `openidconnect` for JWT signature
+rsa 0.10.0 carries the fix, but openidconnect 4.1.0 (the newest release as
+of 2026-11-09) still depends on rsa 0.9, so `cargo update` cannot reach it.
+`rsa` is pulled in transitively by `openidconnect` for JWT signature
 verification, which uses only RSA *public* keys, so the vulnerable private-key
 decryption and signing paths are never exercised by this crate.
 
 Re-evaluate:
-  - when rsa 0.10 ships (drop this entry and bump), AND
+  - when openidconnect moves to rsa >= 0.10 (drop this entry and bump), AND
   - on ANY change that introduces RSA private-key use. The "public keys only"
     premise is behavioural, not structural: openidconnect 4 also supports
     `private_key_jwt` client authentication (signs a client assertion with an
@@ -74,7 +75,7 @@ queued length overflows. Rated low severity upstream.
 
 There is no version to upgrade to. The fix ships only in h2 0.4.16; 0.3.27 is
 the newest release on the 0.3 line and carries no backport. `h2` is pulled in
-by `actix-http`. The lockfile is on actix-http 3.20.0, which as of 2026-10-31
+by `actix-http`. The lockfile is on actix-http 3.21.0, which as of 2026-11-09
 (the newest release) still declares `h2 ^0.3.27`. `http2` is one of
 actix-web's *default* features, so the whole actix-web 4.x line sits on the
 unpatched h2 line and `cargo update` cannot move it.
@@ -99,45 +100,6 @@ features are additive across the dependency graph — any consumer enabling
 `http2` gets the vulnerable code back. That would silence the signal here
 without protecting a single real deployment, which is worse than carrying a
 documented ignore.
-""" },
-    { id = "RUSTSEC-2026-0387", reason = """
-crypto-bigint 0.5 is not reliably constant-time: several operations meant to
-be constant-time (subtraction, zero counting, division, Montgomery
-multiplication, and an early exit in `UintRef` equality) can take
-secret-dependent branches — a timing sidechannel on whatever secret integers
-pass through them.
-
-There is no version to upgrade to. The fix ships only in crypto-bigint 0.7.6,
-with no backport to 0.5.x. The path is openidconnect 4.0.1 -> p256 0.13.2 /
-p384 0.13.1 -> ecdsa 0.16 / primeorder -> elliptic-curve 0.13.8 ->
-crypto-bigint 0.5.5 (its only dependent). elliptic-curve 0.13 pins
-crypto-bigint 0.5, so `cargo update` cannot move it.
-
-Scope: openidconnect uses this code only to *verify* ES256/ES384 ID-token
-signatures, and every input to that is public — the IdP's public key, the
-signature and the digest. No secret integer reaches crypto-bigint, so a timing
-leak has nothing to reveal. `EcdsaP521Sha512` is listed in `ALLOWED_ALGS`
-(src/oidc.rs), but p521 is not in the lockfile, so ES512 never goes through
-crypto-bigint. The crate performs no EC private-key operations; the only
-private key anywhere in the tree is an RSA key in test code. Cookie crypto
-(aes-gcm/hmac) and the RNG do not use crypto-bigint, and `rsa` uses
-num-bigint-dig instead.
-
-Re-evaluate:
-  - when openidconnect moves to elliptic-curve >= 0.14 / crypto-bigint
-    >= 0.7.6 — drop this entry and bump; OR
-  - if crypto-bigint backports the fix to 0.5.x — `cargo update -p
-    crypto-bigint` and drop this entry; AND
-  - on ANY change that introduces EC private-key use. As with the rsa entry,
-    the "public inputs only" premise is behavioural, not structural:
-    `private_key_jwt` client authentication with an ES* key, DPoP proof
-    signing, or ECDH-ES JWE decryption would each put a secret scalar through
-    crypto-bigint and silently invalidate this ignore without changing the
-    dependency graph; AND
-  - if openidconnect adds ES512/p521 support (a new crypto-bigint consumer),
-    if the advisory is amended to cover verification or public-input paths,
-    or if this crate takes a direct dependency on any RustCrypto EC or bigint
-    crate.
 """ },
 ]
 

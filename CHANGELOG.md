@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`actix-web` requirement raised `"4"` → `"4.19"`**, which transitively
+  requires `actix-http` ^3.21, so consumers can no longer resolve a version
+  affected by RUSTSEC-2026-0446, -0447, -0448 or -0455. The lockfile moves
+  `actix-web` 4.18.1 → 4.19.0 and `actix-http` 3.20.0 → 3.21.0. MSRV
+  unchanged (1.89).
+- **`openidconnect` requirement raised `"4"` → `"4.1"`**, which moves the
+  RustCrypto EC stack to `elliptic-curve` 0.14 and the `crypto-bigint` 0.7
+  line, where RUSTSEC-2026-0387 is fixed (>= 0.7.6). The lockfile moves
+  `crypto-bigint` 0.5.5 → 0.7.11 and the `deny.toml` ignore is removed. The
+  floor makes a fixed version reachable for consumers but does not force it:
+  `elliptic-curve` 0.14 accepts `crypto-bigint` 0.7.5, so run
+  `cargo update -p crypto-bigint` if your lockfile pins it. The `rsa`
+  (RUSTSEC-2023-0071) and `h2` (RUSTSEC-2026-0258) ignores remain.
+
 ## [0.5.0] - 2026-10-31
 
 > **Breaking only for consumers building on Rust 1.88**; see Changed. No API
