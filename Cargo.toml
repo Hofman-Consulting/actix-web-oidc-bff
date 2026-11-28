@@ -17,7 +17,7 @@ include = ["src/**", "examples/**", "README.md", "LICENSE-APACHE", "LICENSE-MIT"
 
 [dependencies]
 actix-web = "4.19"
-actix-session = { version = "0.11", features = ["cookie-session"] }
+actix-session = { version = "0.12", features = ["cookie-session"] }
 # default-features off: the bundled reqwest client would otherwise pull
 # native-tls; we want rustls. The crate's HTTP calls (discovery, token
 # exchange) all go through openidconnect's client.
